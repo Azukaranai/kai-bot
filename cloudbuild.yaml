@@ -1,0 +1,17 @@
+substitutions:
+  _REGION: asia-northeast1
+  _AR_REPO: kai-bot
+  _SERVICE: line-webhook
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["build","-t","${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA","."]
+
+  - name: "gcr.io/cloud-builders/docker"
+    args: ["push","${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA"]
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    args: ["run","deploy","${_SERVICE}","--image","${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA","--region","${_REGION}","--quiet"]
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_SERVICE}:$COMMIT_SHA"
