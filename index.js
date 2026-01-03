@@ -141,34 +141,30 @@ function stripTriggerPrefix(text) {
 // =====================
 // Pending actions (follow-up prompts)
 // =====================
-const _pendingByKey = new Map();
-function pendingKey(spaceId, userId) {
-  if (!spaceId || !userId) return null;
-  return `${spaceId}:${userId}`;
-}
-
+const _pendingBySpace = new Map();
 function getPending(spaceId, userId) {
-  const key = pendingKey(spaceId, userId);
-  if (!key) return null;
-  const p = _pendingByKey.get(key);
+  if (!spaceId) return null;
+  const p = _pendingBySpace.get(spaceId);
   if (!p) return null;
   if (Date.now() > p.expiresAt) {
-    _pendingByKey.delete(key);
+    _pendingBySpace.delete(spaceId);
     return null;
   }
+  if (p.userId && userId && p.userId !== userId) return null;
   return p;
 }
 
 function setPending(spaceId, userId, pending, ttlMs = 5 * 60 * 1000) {
-  const key = pendingKey(spaceId, userId);
-  if (!key) return;
-  _pendingByKey.set(key, { ...pending, expiresAt: Date.now() + ttlMs });
+  if (!spaceId) return;
+  _pendingBySpace.set(spaceId, { ...pending, userId: userId || "", expiresAt: Date.now() + ttlMs });
 }
 
 function clearPending(spaceId, userId) {
-  const key = pendingKey(spaceId, userId);
-  if (!key) return;
-  _pendingByKey.delete(key);
+  if (!spaceId) return;
+  const p = _pendingBySpace.get(spaceId);
+  if (!p) return;
+  if (p.userId && userId && p.userId !== userId) return;
+  _pendingBySpace.delete(spaceId);
 }
 
 // =====================
@@ -343,7 +339,7 @@ async function findTasksByQuery(spaceId, query, limit = 200) {
   return tasks.filter((t) => String(t.title || "").toLowerCase().includes(low));
 }
 
-async function sheetsGetProjectsBySpace(spaceId, limit = 50) {
+async function sheetsGetProjectsBySpace(spaceId, limit = 50, { includeDeleted = false } = {}) {
   const values = await sheetsGetValues("Projects!A:Z");
   if (values.length <= 1) return [];
 
@@ -358,14 +354,16 @@ async function sheetsGetProjectsBySpace(spaceId, limit = 50) {
   for (const r of rows) {
     const rSid = String(r[idx.group_id] || "").trim();
     if (rSid !== sid) continue;
-    out.push({
+    const row = {
       project_id: r[idx.project_id] || "",
       title: r[idx.title] || "",
       description: idx.description !== undefined ? r[idx.description] || "" : "",
       status: idx.status !== undefined ? r[idx.status] || "" : "",
       due_at: idx.due_at !== undefined ? r[idx.due_at] || "" : "",
       created_at: idx.created_at !== undefined ? r[idx.created_at] || "" : "",
-    });
+    };
+    if (!includeDeleted && String(row.status || "").toLowerCase() === "deleted") continue;
+    out.push(row);
     if (out.length >= limit) break;
   }
   return out;
@@ -812,6 +810,16 @@ function parseDueAtFromText(text, now = new Date()) {
   return formatJst(dueJst);
 }
 
+function parseProjectTitleFromText(text) {
+  const t = normalizeText(text);
+  if (!t) return "";
+  const m =
+    t.match(/プロジェクト[「『"“]?(.+?)[」』"”]?(?:の|に|で|を|$)/) ||
+    t.match(/([^\s]+?)プロジェクト/);
+  if (!m) return "";
+  return String(m[1] || "").trim();
+}
+
 function regexQuickParse(text) {
   const t = normalizeText(text);
   const quoted = extractQuotedText(t);
@@ -911,6 +919,16 @@ function regexQuickParse(text) {
     };
   }
 
+  // create task (natural + project relation)
+  const mProjTask = t.match(/プロジェクト[「『"“]?(.+?)[」』"”]?\s*(?:の|に)\s*(.+?)\s*(?:を)?\s*(追加|作成|登録)/);
+  if (mProjTask) {
+    return {
+      action: "create_task",
+      title: String(mProjTask[2] || "").trim(),
+      project_title: String(mProjTask[1] || "").trim(),
+    };
+  }
+
   // create project (label)
   const pTitle = t.match(/(?:プロジェクト|project)[:：\s]+([^/\n]+?)(?:\s*(?:\/|$|\n))/i);
   if (pTitle) {
@@ -956,6 +974,20 @@ function regexQuickParse(text) {
     }
   }
 
+  // move task to project
+  if (/(移動|紐付け|割り当て|関連)/.test(t) && /プロジェクト/.test(t)) {
+    const projectTitle = parseProjectTitleFromText(t);
+    const target = extractQueryFromText(t, [
+      /(おーい|ボット|@?KAI\s*bot)/gi,
+      /(タスク|task)/gi,
+      /(を)?\s*プロジェクト[「『"“]?.+?[」』"”]?に/gi,
+      /(移動|紐付け|割り当て|関連)/g,
+    ]);
+    if (target || projectTitle) {
+      return { action: "update_task", query: target || "", project_title: projectTitle };
+    }
+  }
+
   return null;
 }
 
@@ -991,7 +1023,7 @@ async function parseCommandFromText(text) {
       query: String(obj.query || ""),
     };
     if (!cmd.project_title && /プロジェクト|project/i.test(stripped)) {
-      const guessed = extractQuotedText(stripped);
+      const guessed = extractQuotedText(stripped) || parseProjectTitleFromText(stripped);
       if (guessed) cmd.project_title = guessed;
     }
     const due = parseDueAtFromText(stripped);
@@ -1326,8 +1358,17 @@ app.post("/line/webhook", async (req, res) => {
         // Immediate ack to reduce uncertainty
         await reply(event.replyToken, [{ type: "text", text: "解釈中…" }]);
 
-        // Parse command (regex fast path + Vertex AI fallback)
-        const cmd = await parseCommandFromText(rawText);
+        // Fast path: templates/regex without LLM
+        const fast = regexQuickParse(stripped);
+        let cmd;
+        if (fast) {
+          const due = parseDueAtFromText(stripped);
+          if (due) fast.due_at = due;
+          cmd = fast;
+        } else {
+          await reply(event.replyToken, [{ type: "text", text: "解釈中…" }]);
+          cmd = await parseCommandFromText(rawText);
+        }
         console.log("parsed_command", cmd);
 
         // Execute (push results)
