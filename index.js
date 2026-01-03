@@ -572,10 +572,11 @@ async function vertexGenerateJson({ userText, locale = "ja" }) {
 
   const prompt =
     `あなたはタスク管理ボットのコマンド解析器です。必ずJSONのみで返してください。\n` +
-    `次のいずれかの action を返してください: create_task, update_task, delete_task, complete_task, reopen_task, list_tasks, create_project, update_project, delete_project, list_projects, help, unknown\n` +
+    `次のいずれかの action を返してください: create_task, update_task, delete_task, complete_task, reopen_task, list_tasks, create_project, update_project, delete_project, list_projects, help, ask_user, unknown\n` +
     `出力JSONスキーマ（省略可のキーは空文字でも可）:\n` +
-    `{\n  "action":"...",\n  "task_id":"",\n  "project_id":"",\n  "title":"",\n  "new_title":"",\n  "description":"",\n  "due_at":"",\n  "status":"",\n  "project_title":"",\n  "query":""\n}\n` +
-    `注意: ID が文中に無い場合は空文字にする。対象がID不明の場合は query にタイトル断片を入れる。期限は文にある場合だけ入れる（例: 2026-01-10 18:00）。\n` +
+    `{\n  "action":"...",\n  "next_action":"",\n  "target_type":"task|project|none",\n  "question":"",\n  "task_id":"",\n  "project_id":"",\n  "title":"",\n  "new_title":"",\n  "description":"",\n  "due_at":"",\n  "status":"",\n  "project_title":"",\n  "query":""\n}\n` +
+    `注意: 対象が曖昧な場合は action=ask_user にして question と next_action を返す。\n` +
+    `ID が文中に無い場合は空文字にする。対象がID不明の場合は query にタイトル断片を入れる。期限は文にある場合だけ入れる（例: 2026-01-10 18:00）。\n` +
     `ユーザー入力: ${userText}`;
 
   const body = {
@@ -618,6 +619,15 @@ async function vertexGenerateJson({ userText, locale = "ja" }) {
 
 function normalizeText(text) {
   return String(text || "").replace(/\u3000/g, " ").trim();
+}
+
+function extractQueryFromText(text, removePatterns = []) {
+  let t = normalizeText(text);
+  if (!t) return "";
+  for (const re of removePatterns) t = t.replace(re, " ");
+  t = t.replace(/\s+/g, " ").trim();
+  if (!t || t.length < 2) return "";
+  return t;
 }
 
 function extractQuotedText(text) {
@@ -772,36 +782,39 @@ function regexQuickParse(text) {
   const mId = t.match(/(tsk_[0-9a-z]+_[0-9a-z]+)/i);
   if (/(タスク完了|完了|終わった|終わりました|済んだ|done)/i.test(t)) {
     if (mId) return { action: "complete_task", task_id: mId[1] };
-    const title = quoted || t
-      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
-      .replace(/(タスク|task)/gi, " ")
-      .replace(/(完了|終わった|終わりました|済んだ|done)/gi, " ")
-      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
-      .trim();
+    const title = quoted || extractQueryFromText(t, [
+      /(おーい|ボット|@?KAI\s*bot)/gi,
+      /(タスク|task)/gi,
+      /(完了|終わった|終わりました|済んだ|done)/gi,
+      /(を|は|が|の|です|だ|よ|ね)$/g,
+    ]);
     if (title) return { action: "complete_task", query: title };
+    return { action: "complete_task", query: "" };
   }
 
   if (/(タスク再開|再開|未完了|戻す|reopen)/i.test(t)) {
     if (mId) return { action: "reopen_task", task_id: mId[1] };
-    const title = quoted || t
-      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
-      .replace(/(タスク|task)/gi, " ")
-      .replace(/(再開|未完了|戻す|reopen)/gi, " ")
-      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
-      .trim();
+    const title = quoted || extractQueryFromText(t, [
+      /(おーい|ボット|@?KAI\s*bot)/gi,
+      /(タスク|task)/gi,
+      /(再開|未完了|戻す|reopen)/gi,
+      /(を|は|が|の|です|だ|よ|ね)$/g,
+    ]);
     if (title) return { action: "reopen_task", query: title };
+    return { action: "reopen_task", query: "" };
   }
 
   // delete
   if (/(削除|消して|消す|取り消し|delete)/i.test(t)) {
     if (mId) return { action: "delete_task", task_id: mId[1] };
-    const title = quoted || t
-      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
-      .replace(/(タスク|task)/gi, " ")
-      .replace(/(削除|消して|消す|取り消し|delete)/gi, " ")
-      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
-      .trim();
+    const title = quoted || extractQueryFromText(t, [
+      /(おーい|ボット|@?KAI\s*bot)/gi,
+      /(タスク|task)/gi,
+      /(削除|消して|消す|取り消し|delete)/gi,
+      /(を|は|が|の|です|だ|よ|ね)$/g,
+    ]);
     if (title) return { action: "delete_task", query: title };
+    return { action: "delete_task", query: "" };
   }
 
   // create task (label)
@@ -893,6 +906,9 @@ async function parseCommandFromText(text) {
     // Normalize keys
     const cmd = {
       action: String(obj.action || "unknown"),
+      next_action: String(obj.next_action || ""),
+      target_type: String(obj.target_type || ""),
+      question: String(obj.question || ""),
       task_id: String(obj.task_id || ""),
       project_id: String(obj.project_id || ""),
       title: String(obj.title || ""),
@@ -1152,6 +1168,14 @@ app.post("/line/webhook", async (req, res) => {
 
         // Execute (push results)
         const createdBy = src.userId || "";
+
+        if (cmd.action === "ask_user") {
+          const question = cmd.question || "対象を教えてください。";
+          await push(spaceId, [{ type: "text", text: question }]);
+          const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
+          setPending(spaceId, { action: pendingAction });
+          continue;
+        }
 
         if (cmd.action === "help") {
           await push(spaceId, [buildMenuFlex()]);
