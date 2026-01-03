@@ -1439,7 +1439,7 @@ app.post("/line/webhook", async (req, res) => {
           if (due) fast.due_at = due;
           cmd = fast;
         } else {
-          await reply(event.replyToken, [{ type: "text", text: "解釈中…" }]);
+          if (spaceId) await push(spaceId, [{ type: "text", text: "解釈中…" }]);
           cmd = await parseCommandFromText(rawText);
         }
         console.log("parsed_command", cmd);
