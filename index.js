@@ -785,11 +785,21 @@ function regexQuickParse(text) {
   if (mTitle) {
     const mDue = t.match(/(?:期限|due)[:：\s]+([^/\n]+?)(?:\s*(?:\/|$|\n))/i);
     const mStatus = t.match(/(?:status)[:：\s]+([^/\n]+?)(?:\s*(?:\/|$|\n))/i);
+    let projectTitle = "";
+    if (/プロジェクト|project/i.test(t)) {
+      projectTitle =
+        quoted ||
+        (t.match(/プロジェクト\s*([^\sの/]+?)(?:の|\s|$)/) || [])[1] ||
+        (t.match(/([^\s]+?)プロジェクト/) || [])[1] ||
+        "";
+      projectTitle = String(projectTitle || "").trim();
+    }
     return {
       action: "create_task",
       title: String(mTitle[1] || "").trim(),
       due_at: mDue ? String(mDue[1] || "").trim() : "",
       status: mStatus ? String(mStatus[1] || "").trim() : "",
+      project_title: projectTitle,
     };
   }
 
@@ -804,6 +814,19 @@ function regexQuickParse(text) {
       due_at: mDue ? String(mDue[1] || "").trim() : "",
       status: mStatus ? String(mStatus[1] || "").trim() : "",
     };
+  }
+
+  // create project (natural)
+  if (/(プロジェクト|project)/i.test(t) && /(追加|作成|登録|つくる|作る)/.test(t)) {
+    const title =
+      quoted ||
+      (t.match(/([^\s]+?)プロジェクト/) || [])[1] ||
+      t
+        .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+        .replace(/(プロジェクト|project)/gi, " ")
+        .replace(/(追加|作成|登録|つくる|作る)/g, " ")
+        .trim();
+    if (title) return { action: "create_project", title: String(title).trim() };
   }
 
   // update task/project (status or due)
@@ -856,6 +879,10 @@ async function parseCommandFromText(text) {
       project_title: String(obj.project_title || ""),
       query: String(obj.query || ""),
     };
+    if (!cmd.project_title && /プロジェクト|project/i.test(stripped)) {
+      const guessed = extractQuotedText(stripped);
+      if (guessed) cmd.project_title = guessed;
+    }
     const due = parseDueAtFromText(stripped);
     if (due) cmd.due_at = due;
     return cmd;
@@ -878,6 +905,24 @@ function formatProjectMatches(projects) {
     .slice(0, 5)
     .map((p, i) => `${i + 1}. ${p.title || "(no title)"} / id: ${p.project_id || ""}`)
     .join("\n");
+}
+
+function buildMissingNotes(text, cmd) {
+  const t = normalizeText(text);
+  const notes = [];
+
+  const mentionedDue = /(期限|締切|までに|まで|due)/i.test(t);
+  if (mentionedDue && !cmd.due_at) notes.push("期限が不明だったため未設定です。");
+
+  const mentionedStatus = /(status|ステータス|状態|open|doing|done|完了|再開|未完了)/i.test(t);
+  if (mentionedStatus && !cmd.status) notes.push("ステータスが不明だったため未設定です。");
+
+  const mentionedProject = /プロジェクト|project/i.test(t);
+  if (mentionedProject && !cmd.project_title && !cmd.project_id) {
+    notes.push("プロジェクト指定が不明だったため未紐付けです。");
+  }
+
+  return notes;
 }
 
 function buildCreatedSummary(kind, item) {
@@ -1021,7 +1066,7 @@ app.post("/line/webhook", async (req, res) => {
         }
 
         // Immediate ack to reduce uncertainty
-        await reply(event.replyToken, [{ type: "text", text: "解釈中…（少し待ってね）" }]);
+        await reply(event.replyToken, [{ type: "text", text: "解釈中…" }]);
 
         // Parse command (regex fast path + Vertex AI fallback)
         const cmd = await parseCommandFromText(rawText);
@@ -1164,8 +1209,15 @@ app.post("/line/webhook", async (req, res) => {
             created_by: createdBy,
           });
           await push(spaceId, [
-            { type: "text", text: buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }) },
+            {
+              type: "text",
+              text: buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }),
+            },
           ]);
+          const notes = buildMissingNotes(stripped, cmd);
+          if (notes.length) {
+            await push(spaceId, [{ type: "text", text: notes.join("\n") }]);
+          }
           continue;
         }
 
@@ -1232,9 +1284,26 @@ app.post("/line/webhook", async (req, res) => {
             continue;
           }
           await push(spaceId, [{ type: "text", text: "追加中…" }]);
+          let projectId = cmd.project_id || "";
+          let projectTitle = cmd.project_title || "";
+          if (projectTitle && !projectId) {
+            const matches = await findProjectsByQuery(spaceId, projectTitle, 200);
+            if (matches.length > 1) {
+              await push(spaceId, [
+                { type: "text", text: `複数のプロジェクトが見つかりました。名前をもう少し具体的にしてください:\n${formatProjectMatches(matches)}` },
+              ]);
+              continue;
+            }
+            if (matches.length === 1) {
+              projectId = matches[0].project_id;
+              projectTitle = matches[0].title || projectTitle;
+            } else {
+              projectId = "";
+            }
+          }
           const tid = await sheetsAppendTask({
             spaceId,
-            project_id: cmd.project_id || "",
+            project_id: projectId,
             title,
             description: cmd.description || "",
             status: cmd.status || "open",
@@ -1242,16 +1311,26 @@ app.post("/line/webhook", async (req, res) => {
             created_by: createdBy,
           });
           await push(spaceId, [
-            { type: "text", text: buildCreatedSummary("タスク", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "", project_title: cmd.project_title || "" }) },
+            {
+              type: "text",
+              text: buildCreatedSummary("タスク", {
+                title,
+                description: cmd.description || "",
+                status: cmd.status || "open",
+                due_at: cmd.due_at || "",
+                project_title: projectTitle,
+              }),
+            },
           ]);
+          const notes = buildMissingNotes(stripped, { ...cmd, project_title: projectTitle, project_id: projectId });
+          if (notes.length) {
+            await push(spaceId, [{ type: "text", text: notes.join("\n") }]);
+          }
           continue;
         }
 
         // Unknown -> show menu + hint
-        await push(spaceId, [
-          { type: "text", text: "解釈できませんでした。例: ‘議事録作成を明日18時までに追加’ / ‘タスク一覧’ / ‘タスク完了 tsk_xxx’" },
-          buildMenuFlex(),
-        ]);
+        await push(spaceId, [{ type: "text", text: "解釈できませんでした。例: ‘議事録作成を明日18時までに追加’ / ‘タスク一覧’ / ‘タスク完了 tsk_xxx’" }]);
         continue;
       }
 
