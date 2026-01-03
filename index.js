@@ -288,6 +288,17 @@ function formatTaskList(tasks) {
   return lines.join("\n");
 }
 
+async function findTasksByQuery(spaceId, query, limit = 200) {
+  const q = normalizeText(query);
+  if (!q) return [];
+  const tasks = await sheetsGetTasksBySpace(spaceId, limit);
+  const idMatch = tasks.find((t) => String(t.task_id || "") === q);
+  if (idMatch) return [idMatch];
+
+  const low = q.toLowerCase();
+  return tasks.filter((t) => String(t.title || "").toLowerCase().includes(low));
+}
+
 async function sheetsGetProjectsBySpace(spaceId, limit = 50) {
   const values = await sheetsGetValues("Projects!A:Z");
   if (values.length <= 1) return [];
@@ -325,6 +336,17 @@ function formatProjectList(projects) {
       return `${i + 1}. ${p.title} / ${due} / ${st} / id: ${p.project_id}`;
     })
     .join("\n");
+}
+
+async function findProjectsByQuery(spaceId, query, limit = 200) {
+  const q = normalizeText(query);
+  if (!q) return [];
+  const projects = await sheetsGetProjectsBySpace(spaceId, limit);
+  const idMatch = projects.find((p) => String(p.project_id || "") === q);
+  if (idMatch) return [idMatch];
+
+  const low = q.toLowerCase();
+  return projects.filter((p) => String(p.title || "").toLowerCase().includes(low));
 }
 
 async function sheetsAppendProject({ spaceId, title, description, status, due_at, created_by }) {
@@ -415,9 +437,13 @@ async function sheetsUpdateTask(taskId, patch) {
   });
   const row = rowRes.data.values && rowRes.data.values[0] ? rowRes.data.values[0] : [];
 
+  const iTitle = idx["title"];
+  const iDescription = idx["description"];
   const iStatus = idx["status"] ?? 5;
   const iDue = idx["due_at"] ?? 6;
   const iDone = idx["done_at"] ?? 8;
+  const iProject = idx["project_id"];
+  const iDeleted = idx["deleted_at"];
   const iUpdated = idx["updated_at"] ?? 11;
 
   function setCell(i, v) {
@@ -426,14 +452,66 @@ async function sheetsUpdateTask(taskId, patch) {
   }
 
   const now = new Date().toISOString();
+  if (patch.title !== undefined && iTitle !== undefined) setCell(iTitle, patch.title);
+  if (patch.description !== undefined && iDescription !== undefined) setCell(iDescription, patch.description);
   if (patch.status !== undefined) setCell(iStatus, patch.status);
   if (patch.due_at !== undefined) setCell(iDue, patch.due_at);
   if (patch.done_at !== undefined) setCell(iDone, patch.done_at);
+  if (patch.project_id !== undefined && iProject !== undefined) setCell(iProject, patch.project_id);
+  if (patch.deleted_at !== undefined && iDeleted !== undefined) setCell(iDeleted, patch.deleted_at);
   if (idx["updated_at"] !== undefined) setCell(iUpdated, patch.updated_at !== undefined ? patch.updated_at : now);
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `Tasks!A${rowNumber}:Z${rowNumber}`,
+    valueInputOption: "RAW",
+    requestBody: { values: [row] },
+  });
+}
+
+async function sheetsUpdateProject(projectId, patch) {
+  const sheets = getSheetsClient();
+
+  const values = await sheetsGetValues("Projects!A:Z");
+  if (!values.length) throw new Error("Projects sheet is empty");
+
+  const firstRow = (values[0] || []).map((x) => String(x || "").trim());
+  const looksHeader = firstRow.includes("project_id") || firstRow.includes("group_id") || firstRow.includes("title");
+  const header = looksHeader ? firstRow : null;
+  const idx = header ? headerIndex(header) : {};
+
+  const rowNumber = await sheetsFindRowById("Projects", projectId, 0);
+  if (!rowNumber) throw new Error(`Project not found: ${projectId}`);
+
+  const rowRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `Projects!A${rowNumber}:Z${rowNumber}`,
+  });
+  const row = rowRes.data.values && rowRes.data.values[0] ? rowRes.data.values[0] : [];
+
+  const iTitle = idx["title"];
+  const iDescription = idx["description"];
+  const iStatus = idx["status"] ?? 4;
+  const iDue = idx["due_at"] ?? 5;
+  const iDeleted = idx["deleted_at"];
+  const iUpdated = idx["updated_at"] ?? 8;
+
+  function setCell(i, v) {
+    while (row.length <= i) row.push("");
+    row[i] = v;
+  }
+
+  const now = new Date().toISOString();
+  if (patch.title !== undefined && iTitle !== undefined) setCell(iTitle, patch.title);
+  if (patch.description !== undefined && iDescription !== undefined) setCell(iDescription, patch.description);
+  if (patch.status !== undefined) setCell(iStatus, patch.status);
+  if (patch.due_at !== undefined) setCell(iDue, patch.due_at);
+  if (patch.deleted_at !== undefined && iDeleted !== undefined) setCell(iDeleted, patch.deleted_at);
+  if (idx["updated_at"] !== undefined) setCell(iUpdated, patch.updated_at !== undefined ? patch.updated_at : now);
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `Projects!A${rowNumber}:Z${rowNumber}`,
     valueInputOption: "RAW",
     requestBody: { values: [row] },
   });
@@ -471,10 +549,10 @@ async function vertexGenerateJson({ userText, locale = "ja" }) {
 
   const prompt =
     `あなたはタスク管理ボットのコマンド解析器です。必ずJSONのみで返してください。\n` +
-    `次のいずれかの action を返してください: create_task, list_tasks, complete_task, reopen_task, create_project, list_projects, help, unknown\n` +
+    `次のいずれかの action を返してください: create_task, update_task, delete_task, complete_task, reopen_task, list_tasks, create_project, update_project, delete_project, list_projects, help, unknown\n` +
     `出力JSONスキーマ（省略可のキーは空文字でも可）:\n` +
-    `{\n  "action":"...",\n  "task_id":"",\n  "project_id":"",\n  "title":"",\n  "description":"",\n  "due_at":"",\n  "status":"",\n  "project_title":""\n}\n` +
-    `注意: ID が文中に無い場合は空文字にする。期限は文にある場合だけ入れる（例: 2026-01-10 18:00）。\n` +
+    `{\n  "action":"...",\n  "task_id":"",\n  "project_id":"",\n  "title":"",\n  "new_title":"",\n  "description":"",\n  "due_at":"",\n  "status":"",\n  "project_title":"",\n  "query":""\n}\n` +
+    `注意: ID が文中に無い場合は空文字にする。対象がID不明の場合は query にタイトル断片を入れる。期限は文にある場合だけ入れる（例: 2026-01-10 18:00）。\n` +
     `ユーザー入力: ${userText}`;
 
   const body = {
@@ -517,6 +595,21 @@ async function vertexGenerateJson({ userText, locale = "ja" }) {
 
 function normalizeText(text) {
   return String(text || "").replace(/\u3000/g, " ").trim();
+}
+
+function extractQuotedText(text) {
+  const t = String(text || "");
+  const m = t.match(/[「『"“](.+?)[」』"”]/);
+  return m ? String(m[1] || "").trim() : "";
+}
+
+function parseStatusFromText(text) {
+  const t = normalizeText(text);
+  if (!t) return "";
+  if (/(完了|done|終了|終わり)/i.test(t)) return "done";
+  if (/(進行|作業中|着手|doing|in\s*progress)/i.test(t)) return "doing";
+  if (/(未着手|未完了|再開|open|todo)/i.test(t)) return "open";
+  return "";
 }
 
 function toJstDate(d = new Date()) {
@@ -617,17 +710,76 @@ function parseDueAtFromText(text, now = new Date()) {
 
 function regexQuickParse(text) {
   const t = normalizeText(text);
+  const quoted = extractQuotedText(t);
 
   // list
   if (/タスク一覧|list\s*tasks/i.test(t)) return { action: "list_tasks" };
   if (/プロジェクト一覧|list\s*projects/i.test(t)) return { action: "list_projects" };
 
-  // complete/reopen
-  const mDone = t.match(/(?:タスク完了|完了|done)\s+(tsk_[0-9a-z]+_[0-9a-z]+)/i);
-  if (mDone) return { action: "complete_task", task_id: mDone[1] };
+  // project complete/reopen/delete (status-based)
+  if (/プロジェクト|project/i.test(t) && /(完了|終わった|終わりました|済んだ|done)/i.test(t)) {
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(プロジェクト|project)/gi, " ")
+      .replace(/(完了|終わった|終わりました|済んだ|done)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "update_project", query: title, status: "done" };
+  }
+  if (/プロジェクト|project/i.test(t) && /(再開|未完了|戻す|reopen)/i.test(t)) {
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(プロジェクト|project)/gi, " ")
+      .replace(/(再開|未完了|戻す|reopen)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "update_project", query: title, status: "open" };
+  }
+  if (/プロジェクト|project/i.test(t) && /(削除|消して|消す|取り消し|delete)/i.test(t)) {
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(プロジェクト|project)/gi, " ")
+      .replace(/(削除|消して|消す|取り消し|delete)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "delete_project", query: title };
+  }
 
-  const mReopen = t.match(/(?:タスク再開|未完了|戻す|reopen)\s+(tsk_[0-9a-z]+_[0-9a-z]+)/i);
-  if (mReopen) return { action: "reopen_task", task_id: mReopen[1] };
+  // complete/reopen
+  const mId = t.match(/(tsk_[0-9a-z]+_[0-9a-z]+)/i);
+  if (/(タスク完了|完了|終わった|終わりました|済んだ|done)/i.test(t)) {
+    if (mId) return { action: "complete_task", task_id: mId[1] };
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(タスク|task)/gi, " ")
+      .replace(/(完了|終わった|終わりました|済んだ|done)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "complete_task", query: title };
+  }
+
+  if (/(タスク再開|再開|未完了|戻す|reopen)/i.test(t)) {
+    if (mId) return { action: "reopen_task", task_id: mId[1] };
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(タスク|task)/gi, " ")
+      .replace(/(再開|未完了|戻す|reopen)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "reopen_task", query: title };
+  }
+
+  // delete
+  if (/(削除|消して|消す|取り消し|delete)/i.test(t)) {
+    if (mId) return { action: "delete_task", task_id: mId[1] };
+    const title = quoted || t
+      .replace(/(おーい|ボット|@?KAI\s*bot)/gi, " ")
+      .replace(/(タスク|task)/gi, " ")
+      .replace(/(削除|消して|消す|取り消し|delete)/gi, " ")
+      .replace(/(を|は|が|の|です|だ|よ|ね)$/g, " ")
+      .trim();
+    if (title) return { action: "delete_task", query: title };
+  }
 
   // create task (label)
   const mTitle = t.match(/(?:タスク|task)[:：\s]+([^/\n]+?)(?:\s*(?:\/|$|\n))/i);
@@ -655,6 +807,25 @@ function regexQuickParse(text) {
     };
   }
 
+  // update task/project (status or due)
+  if (/(編集|更新|変更|修正)/.test(t)) {
+    const isProject = /プロジェクト|project/i.test(t);
+    const target = quoted || (() => {
+      const m = t.match(/(.+?)(?:の)?(?:タスク|プロジェクト)?(?:の)?(?:期限|ステータス|状態)/);
+      return m ? String(m[1] || "").trim() : "";
+    })();
+    const due = parseDueAtFromText(t);
+    const status = parseStatusFromText(t);
+    if (target || due || status) {
+      return {
+        action: isProject ? "update_project" : "update_task",
+        query: target || "",
+        due_at: due,
+        status,
+      };
+    }
+  }
+
   return null;
 }
 
@@ -679,10 +850,12 @@ async function parseCommandFromText(text) {
       task_id: String(obj.task_id || ""),
       project_id: String(obj.project_id || ""),
       title: String(obj.title || ""),
+      new_title: String(obj.new_title || ""),
       description: String(obj.description || ""),
       due_at: String(obj.due_at || ""),
       status: String(obj.status || ""),
       project_title: String(obj.project_title || ""),
+      query: String(obj.query || ""),
     };
     const due = parseDueAtFromText(stripped);
     if (due) cmd.due_at = due;
@@ -692,6 +865,20 @@ async function parseCommandFromText(text) {
     // last resort: unknown
     return { action: "unknown" };
   }
+}
+
+function formatTaskMatches(tasks) {
+  return tasks
+    .slice(0, 5)
+    .map((t, i) => `${i + 1}. ${t.title || "(no title)"} / id: ${t.task_id || ""}`)
+    .join("\n");
+}
+
+function formatProjectMatches(projects) {
+  return projects
+    .slice(0, 5)
+    .map((p, i) => `${i + 1}. ${p.title || "(no title)"} / id: ${p.project_id || ""}`)
+    .join("\n");
 }
 
 // =====================
@@ -850,22 +1037,101 @@ app.post("/line/webhook", async (req, res) => {
         }
 
         if (cmd.action === "complete_task") {
-          if (!cmd.task_id) {
-            await reply(event.replyToken, [{ type: "text", text: "完了にするタスクIDが見つかりません。例: @KAI bot タスク完了 tsk_xxx" }]);
+          const q = cmd.task_id || cmd.query || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "完了にするタスクが見つかりません。例: @KAI bot 議事録のタスク終わったよ / タスク完了 tsk_xxx" }]);
             continue;
           }
-          await sheetsUpdateTask(cmd.task_id, { status: "done", done_at: new Date().toISOString() });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを完了にしました: ${cmd.task_id}` }]);
+          const matches = await findTasksByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateTask(matches[0].task_id, { status: "done", done_at: new Date().toISOString() });
+          await reply(event.replyToken, [{ type: "text", text: `タスクを完了にしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
           continue;
         }
 
         if (cmd.action === "reopen_task") {
-          if (!cmd.task_id) {
-            await reply(event.replyToken, [{ type: "text", text: "再開するタスクIDが見つかりません。例: @KAI bot タスク再開 tsk_xxx" }]);
+          const q = cmd.task_id || cmd.query || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "再開するタスクが見つかりません。例: @KAI bot 議事録のタスク再開 / タスク再開 tsk_xxx" }]);
             continue;
           }
-          await sheetsUpdateTask(cmd.task_id, { status: "open", done_at: "" });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを再開にしました: ${cmd.task_id}` }]);
+          const matches = await findTasksByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateTask(matches[0].task_id, { status: "open", done_at: "" });
+          await reply(event.replyToken, [{ type: "text", text: `タスクを再開にしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          continue;
+        }
+
+        if (cmd.action === "delete_task") {
+          const q = cmd.task_id || cmd.query || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "削除するタスクが見つかりません。例: @KAI bot 議事録のタスク削除 / タスク削除 tsk_xxx" }]);
+            continue;
+          }
+          const matches = await findTasksByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+          await reply(event.replyToken, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          continue;
+        }
+
+        if (cmd.action === "update_task") {
+          const patch = {};
+          if (cmd.new_title) patch.title = cmd.new_title;
+          if (cmd.description) patch.description = cmd.description;
+          if (cmd.status) patch.status = cmd.status;
+          if (cmd.due_at) patch.due_at = cmd.due_at;
+          if (cmd.project_id) patch.project_id = cmd.project_id;
+
+          const q = cmd.task_id || cmd.query || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "編集するタスクが見つかりません。例: @KAI bot 議事録の期限を明日18時に変更" }]);
+            continue;
+          }
+          if (Object.keys(patch).length === 0) {
+            await reply(event.replyToken, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
+            continue;
+          }
+          const matches = await findTasksByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateTask(matches[0].task_id, patch);
+          await reply(event.replyToken, [{ type: "text", text: `タスクを更新しました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
           continue;
         }
 
@@ -884,6 +1150,60 @@ app.post("/line/webhook", async (req, res) => {
             created_by: createdBy,
           });
           await reply(event.replyToken, [{ type: "text", text: `プロジェクトを追加しました: ${title}\nid: ${pid}` }]);
+          continue;
+        }
+
+        if (cmd.action === "update_project") {
+          const patch = {};
+          if (cmd.new_title) patch.title = cmd.new_title;
+          if (cmd.description) patch.description = cmd.description;
+          if (cmd.status) patch.status = cmd.status;
+          if (cmd.due_at) patch.due_at = cmd.due_at;
+
+          const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "編集するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクトの期限を3/1に変更" }]);
+            continue;
+          }
+          if (Object.keys(patch).length === 0) {
+            await reply(event.replyToken, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
+            continue;
+          }
+          const matches = await findProjectsByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatProjectMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateProject(matches[0].project_id, patch);
+          await reply(event.replyToken, [{ type: "text", text: `プロジェクトを更新しました: ${matches[0].title} (id: ${matches[0].project_id})` }]);
+          continue;
+        }
+
+        if (cmd.action === "delete_project") {
+          const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
+          if (!q) {
+            await reply(event.replyToken, [{ type: "text", text: "削除するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクト削除" }]);
+            continue;
+          }
+          const matches = await findProjectsByQuery(spaceId, q, 200);
+          if (!matches.length) {
+            await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
+            continue;
+          }
+          if (matches.length > 1) {
+            await reply(event.replyToken, [
+              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatProjectMatches(matches)}` },
+            ]);
+            continue;
+          }
+          await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
+          await reply(event.replyToken, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title} (id: ${matches[0].project_id})` }]);
           continue;
         }
 
