@@ -6,7 +6,7 @@ const { google } = require("googleapis");
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-const SHEETS_SA_KEY_JSON = process.env.KAI_BOT_SHEETS_SA_KEY_JSON;
+const SHEETS_SA_KEY_JSON = process.env.KAI_BOT_SHEETS_SA_KEY_JSON; // JSON文字列
 const SPREADSHEET_ID = process.env.KAI_BOT_SHEETS_SPREADSHEET_ID;
 
 const app = express();
@@ -63,33 +63,29 @@ async function reply(replyToken, messages) {
   await lineApi("/v2/bot/message/reply", { replyToken, messages });
 }
 
+async function push(to, messages) {
+  await lineApi("/v2/bot/message/push", { to, messages });
+}
+
 // ===== Trigger: KAI bot official name =====
+// 仕様（あなたの要望どおり）
 // - "@KAI bot"/"＠KAI bot" は文中どこでも反応（@/＠必須）
 // - "ボット/ぼっと/おーい" は文頭のみ反応
-function isTriggeredText(textRaw) {
-  const text = String(textRaw || "").replace(/\u3000/g, " ").trim();
-  if (/[@＠]\s*KAI\s*bot/i.test(text)) return true;
-  return /^(?:ボット|ぼっと|おーい)(?:\s|[、,。.!！?？:：]|$)/.test(text);
+function isTriggeredTextEvent(event) {
+  if (event.type !== "message") return false;
+  if (!event.message || event.message.type !== "text") return false;
+
+  const raw = String(event.message.text || "");
+  const text = raw.replace(/\u3000/g, " ").trim();
+
+  const anywhereKai = /[@＠]\s*KAI\s*bot/i;
+  if (anywhereKai.test(text)) return true;
+
+  const headOnly = /^(?:ボット|ぼっと|おーい)(?:\s|[、,。.!！?？:：]|$)/;
+  return headOnly.test(text);
 }
 
-function stripTrigger(textRaw) {
-  let text = String(textRaw || "").replace(/\u3000/g, " ").trim();
-  text = text.replace(/[@＠]\s*KAI\s*bot\s*/gi, "").trim();
-  text = text.replace(/^(?:ボット|ぼっと|おーい)(?:\s|[、,。.!！?？:：]|$)\s*/i, "").trim();
-  return text;
-}
-
-// ===== Throttle (best-effort; per-instance) =====
-const recentActions = new Map();
-function isThrottled(key, ms = 2000) {
-  const now = Date.now();
-  const last = recentActions.get(key) || 0;
-  if (now - last < ms) return true;
-  recentActions.set(key, now);
-  return false;
-}
-
-// ===== Flex UI (displayText付き) =====
+// ===== Flex UI =====
 function buildMenuFlex() {
   return {
     type: "flex",
@@ -106,21 +102,9 @@ function buildMenuFlex() {
         layout: "vertical",
         spacing: "md",
         contents: [
-          {
-            type: "button",
-            style: "primary",
-            action: { type: "postback", label: "タスク追加", data: "a=task_new", displayText: "KAI bot：タスク追加" },
-          },
-          {
-            type: "button",
-            style: "secondary",
-            action: { type: "postback", label: "タスク一覧", data: "a=task_list", displayText: "KAI bot：タスク一覧" },
-          },
-          {
-            type: "button",
-            style: "secondary",
-            action: { type: "postback", label: "ヘルプ", data: "a=help", displayText: "KAI bot：ヘルプ" },
-          },
+          { type: "button", style: "primary", action: { type: "postback", label: "タスク追加", data: "a=task_new" } },
+          { type: "button", style: "secondary", action: { type: "postback", label: "タスク一覧", data: "a=task_list" } },
+          { type: "button", style: "secondary", action: { type: "postback", label: "設定", data: "a=settings" } },
         ],
       },
       footer: {
@@ -140,7 +124,7 @@ function buildMenuFlex() {
   };
 }
 
-// ===== Sheets Adapter =====
+// ===== Sheets Adapter (MVP) =====
 function getSheetsClient() {
   if (!SHEETS_SA_KEY_JSON) throw new Error("Missing env: KAI_BOT_SHEETS_SA_KEY_JSON");
   if (!SPREADSHEET_ID) throw new Error("Missing env: KAI_BOT_SHEETS_SPREADSHEET_ID");
@@ -155,18 +139,7 @@ function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
-async function sheetsAppendRow(sheetName, rowValues) {
-  const sheets = getSheetsClient();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `${sheetName}!A:Z`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [rowValues] },
-  });
-}
-
-async function sheetsGetTasksByGroup(spaceId, limit = 20) {
+async function sheetsGetTasksByGroup(groupId, limit = 20) {
   const sheets = getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -174,49 +147,31 @@ async function sheetsGetTasksByGroup(spaceId, limit = 20) {
   });
 
   const values = res.data.values || [];
-  if (!values.length) return [];
+  if (values.length <= 1) return [];
 
-  const firstRow = (values[0] || []).map((x) => String(x || "").trim());
-  const looksHeader =
-    firstRow.includes("task_id") ||
-    firstRow.includes("group_id") ||
-    firstRow.includes("title") ||
-    firstRow.includes("status");
+  const header = values[0];
+  const rows = values.slice(1);
 
-  const header = looksHeader ? firstRow : null;
-  const rows = looksHeader ? values.slice(1) : values;
+  const idx = Object.fromEntries(header.map((h, i) => [h, i]));
+  const out = [];
+  const gid = String(groupId || "").trim();
 
-  // appendの列順（ヘッダが壊れていても読める）
-  // A task_id / B group_id(spaceId) / D title / F status / H due_at
-  const idx = header ? Object.fromEntries(header.map((h, i) => [h, i])) : {};
-  const iGroup = idx["group_id"] ?? 1;
-  const iTitle = idx["title"] ?? 3;
-  const iStatus = idx["status"] ?? 5;
-  const iDue = idx["due_at"] ?? 7;
-
-  const gid = String(spaceId || "").trim();
-  const sampleGroupValues = rows.slice(0, 8).map((r) => String((r || [])[iGroup] || "").trim());
-
-  // 一覧が出ない原因はここで特定できる（Cloud Run logs で見る）
+  const sampleGroupValues = rows.slice(0, 5).map((r) => String((r || [])[idx.group_id] || "").trim());
   console.log("tasks_sheet_debug", {
-    looksHeader,
-    headerPreview: header ? header.slice(0, 12) : null,
-    spaceId: gid,
-    iGroup,
-    iTitle,
-    iStatus,
-    iDue,
+    groupId: gid,
+    headerPreview: header.slice(0, 12),
     sampleGroupValues,
   });
 
-  const out = [];
   for (const r of rows) {
-    const rGid = String((r[iGroup] || "")).trim();
+    const rGid = String(r[idx.group_id] || "").trim();
     if (rGid !== gid) continue;
     out.push({
-      title: r[iTitle] || "",
-      status: r[iStatus] || "",
-      due_at: r[iDue] || "",
+      task_id: r[idx.task_id] || "",
+      title: r[idx.title] || "",
+      status: r[idx.status] || "",
+      due_at: r[idx.due_at] || "",
+      created_at: r[idx.created_at] || "",
     });
     if (out.length >= limit) break;
   }
@@ -233,162 +188,116 @@ function formatTaskList(tasks) {
   return lines.join("\n");
 }
 
-function getSpaceId(event) {
+function getGroupId(event) {
   const s = event.source || {};
-  if (s.type === "group") return s.groupId;
-  if (s.type === "room") return s.roomId; // 念のため
-  return null;
+  return s.type === "group" ? s.groupId : null;
 }
 
-function getUserId(event) {
+function pickReplyTarget(event) {
   const s = event.source || {};
-  return s.userId || "";
-}
-
-// 定型パース: "タスク: ... / 期限: ... / status: ..."
-function parseTaskCommand(text) {
-  const parts = String(text || "")
-    .split(/[\/／]/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  const kv = {};
-  for (const p of parts) {
-    const m = p.match(/^([^:：]+)\s*[:：]\s*(.+)$/);
-    if (!m) continue;
-    const k = m[1].trim().toLowerCase();
-    const v = m[2].trim();
-    kv[k] = v;
-  }
-
-  const title = kv["タスク"] || kv["task"] || kv["title"] || "";
-  const due_at = kv["期限"] || kv["due"] || kv["due_at"] || "";
-  const status = (kv["status"] || kv["ステータス"] || "open").toLowerCase();
-  const description = kv["description"] || kv["説明"] || "";
-
-  return { title, due_at, status, description };
-}
-
-function helpText() {
-  return (
-    "KAI bot ヘルプ（MVP）\n\n" +
-    "1) メニュー表示\n" +
-    "  おーい / ボット / ぼっと（文頭） または 文中に @KAI bot\n\n" +
-    "2) タスク追加（定型）\n" +
-    "  @KAI bot タスク: 議事録作成 / 期限: 2026-01-10 18:00 / status: open\n\n" +
-    "3) タスク一覧\n" +
-    "  メニュー → タスク一覧\n"
-  );
+  return s.groupId || s.roomId || s.userId || null;
 }
 
 app.get("/", (req, res) => res.status(200).send("ok"));
 
 app.post("/line/webhook", async (req, res) => {
-  if (!verifySignature(req)) return res.status(401).send("invalid signature");
+  if (!verifySignature(req)) {
+    console.warn("invalid signature (LINE_CHANNEL_SECRET mismatch or bad request)");
+    return res.status(401).send("invalid signature");
+  }
 
-  const events = req.body && Array.isArray(req.body.events) ? req.body.events : [];
+  const body = req.body || {};
+  const events = Array.isArray(body.events) ? body.events : [];
+
+  // 先に 200 を返す（LINE のタイムアウト回避）
   res.status(200).send("ok");
+
+  console.log("webhook_received", {
+    destination: body.destination || null,
+    eventsCount: events.length,
+  });
 
   for (const event of events) {
     try {
-      // postback
-      if (event.type === "postback" && event.replyToken) {
-        const pb = parsePostbackData(event.postback && event.postback.data);
-        const spaceId = getSpaceId(event);
-        const userId = getUserId(event);
+      const src = event.source || {};
+      const summary = {
+        type: event.type,
+        replyToken: !!event.replyToken,
+        sourceType: src.type || null,
+        groupId: src.groupId ? "(present)" : null,
+        roomId: src.roomId ? "(present)" : null,
+        userId: src.userId ? "(present)" : null,
+      };
 
-        const throttleKey = `${spaceId || "nospace"}:${userId || "nouser"}:${pb.a || "unknown"}`;
-        if (isThrottled(throttleKey, 2000)) continue;
+      if (event.type === "message" && event.message) {
+        summary.messageType = event.message.type;
+        if (event.message.type === "text") {
+          summary.text = String(event.message.text || "").slice(0, 200);
+          summary.mention = !!event.message.mention;
+        }
+      }
+      if (event.type === "postback") {
+        summary.postbackData = String((event.postback && event.postback.data) || "").slice(0, 200);
+      }
+
+      console.log("event", summary);
+
+      const target = pickReplyTarget(event);
+
+      // ---- Postback は必ず即ACK（連打防止）＋ 誰が触ったか通知 ----
+      if (event.type === "postback" && event.replyToken) {
+        await reply(event.replyToken, [{ type: "text", text: "受け付けました。反映します…" }]);
+
+        const who =
+          src.userId ? `操作者: ${src.userId.slice(0, 6)}…` : "操作者: (unknown)"; // まずは識別子だけ
+        if (target) {
+          await push(target, [{ type: "text", text: `${who}\n処理中…（連打しないでOK）` }]);
+        }
+
+        const pb = parsePostbackData(event.postback && event.postback.data);
+        const groupId = getGroupId(event);
 
         if (pb.a === "task_new") {
-          await reply(event.replyToken, [
-            {
-              type: "text",
-              text:
-                "タスク追加（定型）:\n" +
-                "@KAI bot タスク: 議事録作成 / 期限: 2026-01-10 18:00 / status: open\n" +
-                "（期限なしも可。status は open/done を想定）",
-            },
-          ]);
+          if (target) {
+            await push(target, [
+              {
+                type: "text",
+                text:
+                  "タスク追加（現状は定型入力）:\n" +
+                  "例: @KAI bot タスク: 議事録作成 / 期限: 2026-01-10 18:00 / status: open",
+              },
+            ]);
+          }
           continue;
         }
 
         if (pb.a === "task_list") {
-          if (!spaceId) {
-            await reply(event.replyToken, [{ type: "text", text: "タスク一覧はグループ（または複数人トーク）内で使用してください。" }]);
+          if (!groupId) {
+            if (target) await push(target, [{ type: "text", text: "タスク一覧はグループ内で使用してください。" }]);
             continue;
           }
-          const tasks = await sheetsGetTasksByGroup(spaceId, 20);
-          await reply(event.replyToken, [{ type: "text", text: formatTaskList(tasks) }]);
+          const tasks = await sheetsGetTasksByGroup(groupId, 20);
+          if (target) await push(target, [{ type: "text", text: formatTaskList(tasks) }]);
           continue;
         }
 
-        if (pb.a === "help") {
-          await reply(event.replyToken, [{ type: "text", text: helpText() }]);
+        if (pb.a === "settings") {
+          if (target) await push(target, [{ type: "text", text: "設定UIは次で実装します（notify/quota/powerusers）。" }]);
           continue;
         }
 
-        await reply(event.replyToken, [buildMenuFlex()]);
+        if (target) await push(target, [buildMenuFlex()]);
         continue;
       }
 
-      // trigger text -> menu or task add
-      if (event.type === "message" && event.replyToken && event.message && event.message.type === "text") {
-        const raw = event.message.text;
-        if (!isTriggeredText(raw)) continue;
-
-        const spaceId = getSpaceId(event);
-        if (!spaceId) {
-          await reply(event.replyToken, [{ type: "text", text: "KAI bot は現在グループ（または複数人トーク）での使用を前提にしています。" }]);
+      // ---- テキストトリガー ----
+      if (event.replyToken && event.type === "message" && event.message && event.message.type === "text") {
+        const triggered = isTriggeredTextEvent(event);
+        console.log("trigger_check", { text: String(event.message.text || "").slice(0, 200), triggered });
+        if (triggered) {
+          await reply(event.replyToken, [buildMenuFlex()]);
           continue;
         }
-
-        const body = stripTrigger(raw);
-
-        if (/^(help|ヘルプ)$/i.test(body)) {
-          await reply(event.replyToken, [{ type: "text", text: helpText() }]);
-          continue;
-        }
-
-        if (body.includes("タスク") || /task\s*[:：]/i.test(body)) {
-          const { title, due_at, status, description } = parseTaskCommand(body);
-
-          if (!title) {
-            await reply(event.replyToken, [
-              { type: "text", text: "タスク名が不足しています。例:\n@KAI bot タスク: 議事録作成 / 期限: 2026-01-10 18:00 / status: open" },
-            ]);
-            continue;
-          }
-
-          const now = new Date().toISOString();
-          const task_id = `tsk_${crypto.randomUUID()}`;
-          const creator_user_id = getUserId(event);
-
-          const normalizedStatus = status === "done" ? "done" : "open";
-          const done_at = normalizedStatus === "done" ? now : "";
-
-          console.log("task_append_debug", { spaceId, task_id, title });
-
-          await sheetsAppendRow("Tasks", [
-            task_id,
-            spaceId,            // group_id (space)
-            "",                 // project_id
-            title,
-            description,
-            normalizedStatus,
-            now,                // created_at
-            due_at || "",       // due_at
-            done_at,            // done_at
-            creator_user_id,
-            "[]",               // assignees_json (MVP)
-          ]);
-
-          const dueMsg = due_at ? `期限: ${due_at}` : "期限: なし（設定されていません）";
-          await reply(event.replyToken, [{ type: "text", text: `追加しました。\n${title}\n${dueMsg}\nstatus: ${normalizedStatus}` }]);
-          continue;
-        }
-
-        await reply(event.replyToken, [buildMenuFlex()]);
       }
     } catch (e) {
       console.error("Event handling error:", e);
