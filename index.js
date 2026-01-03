@@ -820,6 +820,81 @@ function parseProjectTitleFromText(text) {
   return String(m[1] || "").trim();
 }
 
+// =====================
+// Templates (learned phrases)
+// =====================
+let _templateCache = { data: null, expMs: 0 };
+
+async function loadTemplates() {
+  const now = Date.now();
+  if (_templateCache.data && now < _templateCache.expMs) return _templateCache.data;
+
+  try {
+    const values = await sheetsGetValues("Templates!A:Z");
+    if (!values.length) return [];
+    const header = values[0].map((v) => String(v || "").trim());
+    const idx = headerIndex(header);
+    if (idx.text === undefined || idx.action === undefined) return [];
+
+    const rows = values.slice(1);
+    const data = rows
+      .map((r) => ({
+        text: String(r[idx.text] || "").trim(),
+        action: String(r[idx.action] || "").trim(),
+        target_type: idx.target_type !== undefined ? String(r[idx.target_type] || "").trim() : "",
+        query: idx.query !== undefined ? String(r[idx.query] || "").trim() : "",
+        project_title: idx.project_title !== undefined ? String(r[idx.project_title] || "").trim() : "",
+        status: idx.status !== undefined ? String(r[idx.status] || "").trim() : "",
+        due_at: idx.due_at !== undefined ? String(r[idx.due_at] || "").trim() : "",
+      }))
+      .filter((r) => r.text && r.action);
+
+    _templateCache = { data, expMs: now + 60 * 1000 };
+    return data;
+  } catch {
+    return [];
+  }
+}
+
+async function matchTemplate(text) {
+  const key = normalizeText(text).toLowerCase();
+  if (!key) return null;
+  const templates = await loadTemplates();
+  const hit = templates.find((t) => t.text.toLowerCase() === key);
+  if (!hit) return null;
+  return {
+    action: hit.action,
+    target_type: hit.target_type || "",
+    query: hit.query || "",
+    project_title: hit.project_title || "",
+    status: hit.status || "",
+    due_at: hit.due_at || "",
+  };
+}
+
+async function recordTemplate(text, cmd) {
+  const key = normalizeText(text);
+  if (!key || !cmd || !cmd.action) return;
+  const templates = await loadTemplates();
+  if (templates.some((t) => t.text.toLowerCase() === key.toLowerCase())) return;
+
+  try {
+    await sheetsAppendRow("Templates", [
+      key,
+      cmd.action || "",
+      cmd.target_type || "",
+      cmd.query || cmd.title || "",
+      cmd.project_title || "",
+      cmd.status || "",
+      cmd.due_at || "",
+      new Date().toISOString(),
+    ]);
+    _templateCache.expMs = 0;
+  } catch {
+    // If Templates sheet doesn't exist, ignore.
+  }
+}
+
 function regexQuickParse(text) {
   const t = normalizeText(text);
   const quoted = extractQuotedText(t);
@@ -1355,11 +1430,9 @@ app.post("/line/webhook", async (req, res) => {
           continue;
         }
 
-        // Immediate ack to reduce uncertainty
-        await reply(event.replyToken, [{ type: "text", text: "解釈中…" }]);
-
         // Fast path: templates/regex without LLM
-        const fast = regexQuickParse(stripped);
+        const templ = await matchTemplate(stripped);
+        const fast = templ || regexQuickParse(stripped);
         let cmd;
         if (fast) {
           const due = parseDueAtFromText(stripped);
@@ -1370,6 +1443,7 @@ app.post("/line/webhook", async (req, res) => {
           cmd = await parseCommandFromText(rawText);
         }
         console.log("parsed_command", cmd);
+        await recordTemplate(stripped, cmd);
 
         // Execute (push results)
         const createdBy = src.userId || "";
@@ -1498,6 +1572,20 @@ app.post("/line/webhook", async (req, res) => {
           if (cmd.status) patch.status = cmd.status;
           if (cmd.due_at) patch.due_at = cmd.due_at;
           if (cmd.project_id) patch.project_id = cmd.project_id;
+          if (cmd.project_title && !cmd.project_id) {
+            const projMatches = await findProjectsByQuery(spaceId, cmd.project_title, 200);
+            if (!projMatches.length) {
+              await push(spaceId, [{ type: "text", text: `プロジェクトが見つかりませんでした: ${cmd.project_title}` }]);
+              continue;
+            }
+            if (projMatches.length > 1) {
+              await push(spaceId, [
+                { type: "text", text: `複数のプロジェクトが見つかりました。より具体的に教えてください:\n${formatProjectMatches(projMatches)}` },
+              ]);
+              continue;
+            }
+            patch.project_id = projMatches[0].project_id;
+          }
 
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
