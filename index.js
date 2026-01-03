@@ -139,6 +139,30 @@ function stripTriggerPrefix(text) {
 }
 
 // =====================
+// Pending actions (follow-up prompts)
+// =====================
+const _pendingBySpace = new Map();
+function getPending(spaceId) {
+  const p = _pendingBySpace.get(spaceId);
+  if (!p) return null;
+  if (Date.now() > p.expiresAt) {
+    _pendingBySpace.delete(spaceId);
+    return null;
+  }
+  return p;
+}
+
+function setPending(spaceId, pending, ttlMs = 5 * 60 * 1000) {
+  if (!spaceId) return;
+  _pendingBySpace.set(spaceId, { ...pending, expiresAt: Date.now() + ttlMs });
+}
+
+function clearPending(spaceId) {
+  if (!spaceId) return;
+  _pendingBySpace.delete(spaceId);
+}
+
+// =====================
 // Flex UI
 // =====================
 function buildMenuFlex() {
@@ -1051,7 +1075,61 @@ app.post("/line/webhook", async (req, res) => {
         const triggered = isTriggeredText(rawText);
         console.log("trigger_check", { triggered, textPreview: rawText.slice(0, 200) });
 
-        if (!triggered) continue;
+        if (!triggered) {
+          if (spaceId) {
+            const pending = getPending(spaceId);
+            if (pending) {
+              const followText = normalizeText(rawText);
+              if (/^(キャンセル|やめる|中止)$/i.test(followText)) {
+                clearPending(spaceId);
+                await reply(event.replyToken, [{ type: "text", text: "キャンセルしました。" }]);
+                continue;
+              }
+
+              const query = followText;
+              if (pending.action === "delete_task") {
+                const matches = await findTasksByQuery(spaceId, query, 200);
+                if (!matches.length) {
+                  await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。もう一度教えてください。" }]);
+                  continue;
+                }
+                if (matches.length > 1) {
+                  await reply(event.replyToken, [
+                    { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}` },
+                  ]);
+                  continue;
+                }
+                await push(spaceId, [{ type: "text", text: "削除中…" }]);
+                await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+                await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
+                clearPending(spaceId);
+                continue;
+              }
+
+              if (pending.action === "delete_project") {
+                const matches = await findProjectsByQuery(spaceId, query, 200);
+                if (!matches.length) {
+                  await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。もう一度教えてください。" }]);
+                  continue;
+                }
+                if (matches.length > 1) {
+                  await reply(event.replyToken, [
+                    { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}` },
+                  ]);
+                  continue;
+                }
+                await push(spaceId, [{ type: "text", text: "削除中…" }]);
+                await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
+                await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
+                clearPending(spaceId);
+                continue;
+              }
+            }
+          }
+          continue;
+        }
+
+        if (spaceId) clearPending(spaceId);
 
         // If user only called bot, show menu.
         const stripped = stripTriggerPrefix(rawText);
@@ -1139,7 +1217,8 @@ app.post("/line/webhook", async (req, res) => {
         if (cmd.action === "delete_task") {
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
-            await push(spaceId, [{ type: "text", text: "削除するタスクが見つかりません。例: @KAI bot 議事録のタスク削除 / タスク削除 tsk_xxx" }]);
+            await push(spaceId, [{ type: "text", text: "どのタスクを削除しますか？" }]);
+            setPending(spaceId, { action: "delete_task" });
             continue;
           }
           const matches = await findTasksByQuery(spaceId, q, 200);
@@ -1257,7 +1336,8 @@ app.post("/line/webhook", async (req, res) => {
         if (cmd.action === "delete_project") {
           const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
           if (!q) {
-            await push(spaceId, [{ type: "text", text: "削除するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクト削除" }]);
+            await push(spaceId, [{ type: "text", text: "どのプロジェクトを削除しますか？" }]);
+            setPending(spaceId, { action: "delete_project" });
             continue;
           }
           const matches = await findProjectsByQuery(spaceId, q, 200);
