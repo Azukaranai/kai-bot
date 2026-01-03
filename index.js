@@ -1918,7 +1918,16 @@ app.post("/line/webhook", async (req, res) => {
 // Discord Interactions
 // =====================
 app.post("/discord/interactions", async (req, res) => {
+  const sig = req.get("x-signature-ed25519");
+  const ts = req.get("x-signature-timestamp");
+  console.log("discord_incoming", {
+    hasSignature: !!sig,
+    hasTimestamp: !!ts,
+    hasPublicKey: !!DISCORD_PUBLIC_KEY,
+    hasBody: !!req.rawBody,
+  });
   if (!verifyDiscordSignature(req)) {
+    console.warn("discord_invalid_signature");
     return res.status(401).send("invalid signature");
   }
 
