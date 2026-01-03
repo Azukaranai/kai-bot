@@ -637,6 +637,48 @@ function splitQueries(text) {
     .filter(Boolean);
 }
 
+function inferIntentFromText(text) {
+  const t = normalizeText(text);
+  const hasTask = /タスク|task/i.test(t);
+  const hasProject = /プロジェクト|project/i.test(t);
+
+  let action = "";
+  if (/(削除|消して|消す|取り消し|delete)/i.test(t)) action = "delete";
+  else if (/(完了|終わった|終わりました|済んだ|done)/i.test(t)) action = "complete";
+  else if (/(再開|未完了|戻す|reopen)/i.test(t)) action = "reopen";
+  else if (/(変更|更新|修正|編集)/.test(t)) action = "update";
+  else if (/(追加|作成|登録|つくる|作る)/.test(t)) action = "create";
+  else if (/(一覧|見せて|リスト|list)/i.test(t)) action = "list";
+
+  const targetType = hasProject ? "project" : hasTask ? "task" : "";
+  const query = extractQueryFromText(t, [
+    /(おーい|ボット|@?KAI\s*bot)/gi,
+    /(タスク|task|プロジェクト|project)/gi,
+    /(削除|消して|消す|取り消し|delete|完了|終わった|終わりました|済んだ|done|再開|未完了|戻す|reopen|変更|更新|修正|編集|追加|作成|登録|つくる|作る|一覧|見せて|リスト|list)/gi,
+  ]);
+
+  const missingTarget = ["delete", "complete", "reopen", "update"].includes(action) && !query;
+  return { action, targetType, query, missingTarget };
+}
+
+function buildUnknownResponse(text, intent) {
+  const lines = ["ごめん、全部は理解できなかった。"];
+  const understood = [];
+  if (intent.action) understood.push(`意図: ${intent.action}`);
+  if (intent.targetType) understood.push(`対象: ${intent.targetType}`);
+  if (intent.query) understood.push(`名前候補: ${intent.query}`);
+  if (understood.length) lines.push(`分かったこと: ${understood.join(" / ")}`);
+
+  const missing = [];
+  if (!intent.action) missing.push("やりたいこと（追加/完了/削除など）");
+  if (intent.action && !intent.targetType) missing.push("対象（タスク or プロジェクト）");
+  if (intent.missingTarget) missing.push("対象の名前");
+  if (missing.length) lines.push(`足りないこと: ${missing.join(" / ")}`);
+
+  lines.push("例: タスクを削除 → 『議事録』とだけ送る / タスク完了 〇〇 / プロジェクト追加 卒論");
+  return lines.join("\n");
+}
+
 function extractQuotedText(text) {
   const t = String(text || "");
   const m = t.match(/[「『"“](.+?)[」』"”]/);
@@ -1231,6 +1273,18 @@ app.post("/line/webhook", async (req, res) => {
           await push(spaceId, [{ type: "text", text: question }]);
           const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
           setPending(spaceId, { action: pendingAction });
+          continue;
+        }
+
+        if (cmd.action === "unknown") {
+          const intent = inferIntentFromText(stripped);
+          if (intent.action === "delete" && intent.targetType && intent.missingTarget) {
+            const q = intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？";
+            await push(spaceId, [{ type: "text", text: q }]);
+            setPending(spaceId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
+            continue;
+          }
+          await push(spaceId, [{ type: "text", text: buildUnknownResponse(stripped, intent) }]);
           continue;
         }
 
