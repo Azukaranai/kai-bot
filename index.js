@@ -461,7 +461,11 @@ async function vertexGenerateJson({ userText, locale = "ja" }) {
     scopes: ["https://www.googleapis.com/auth/cloud-platform"],
   });
   const client = await auth.getClient();
-  const token = await client.getAccessToken();
+  const tokenResp = await client.getAccessToken();
+  const token = typeof tokenResp === "string" ? tokenResp : tokenResp && tokenResp.token;
+  if (!token) {
+    throw new Error("Vertex access token is empty. Check service account auth.");
+  }
 
   const endpoint = `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${VERTEX_MODEL_ID}:generateContent`;
 
