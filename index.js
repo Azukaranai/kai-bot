@@ -519,6 +519,102 @@ function normalizeText(text) {
   return String(text || "").replace(/\u3000/g, " ").trim();
 }
 
+function toJstDate(d = new Date()) {
+  return new Date(d.getTime() + 9 * 60 * 60 * 1000);
+}
+
+function formatJst(dateJst) {
+  const y = dateJst.getUTCFullYear();
+  const m = String(dateJst.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(dateJst.getUTCDate()).padStart(2, "0");
+  const hh = String(dateJst.getUTCHours()).padStart(2, "0");
+  const mm = String(dateJst.getUTCMinutes()).padStart(2, "0");
+  return `${y}-${m}-${d} ${hh}:${mm}`;
+}
+
+function parseTimeFromText(text) {
+  const t = String(text || "");
+
+  let m = t.match(/(\d{1,2})[:：](\d{2})/);
+  if (m) return { hour: Number(m[1]), minute: Number(m[2]) };
+
+  m = t.match(/(\d{1,2})\s*時(?:\s*(\d{1,2})\s*分?)?/);
+  if (m) return { hour: Number(m[1]), minute: m[2] ? Number(m[2]) : 0 };
+
+  if (/正午/.test(t)) return { hour: 12, minute: 0 };
+  if (/今夜/.test(t)) return { hour: 21, minute: 0 };
+
+  return null;
+}
+
+function parseDueAtFromText(text, now = new Date()) {
+  const t = normalizeText(text);
+  if (!t) return "";
+
+  const nowJst = toJstDate(now);
+  let y = nowJst.getUTCFullYear();
+  let m = null;
+  let d = null;
+
+  // YYYY-MM-DD or YYYY/MM/DD
+  let m1 = t.match(/(20\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m1) {
+    y = Number(m1[1]);
+    m = Number(m1[2]);
+    d = Number(m1[3]);
+  }
+
+  // M/D or M月D日 (no year)
+  if (m === null) {
+    m1 = t.match(/(\d{1,2})[\/\-](\d{1,2})/);
+    if (m1) {
+      m = Number(m1[1]);
+      d = Number(m1[2]);
+    } else {
+      m1 = t.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+      if (m1) {
+        m = Number(m1[1]);
+        d = Number(m1[2]);
+      }
+    }
+  }
+
+  // relative day words
+  if (m === null && d === null) {
+    if (/明日/.test(t)) {
+      const next = new Date(nowJst.getTime() + 24 * 60 * 60 * 1000);
+      y = next.getUTCFullYear();
+      m = next.getUTCMonth() + 1;
+      d = next.getUTCDate();
+    } else if (/明後日/.test(t)) {
+      const next = new Date(nowJst.getTime() + 2 * 24 * 60 * 60 * 1000);
+      y = next.getUTCFullYear();
+      m = next.getUTCMonth() + 1;
+      d = next.getUTCDate();
+    } else if (/今日|本日/.test(t)) {
+      y = nowJst.getUTCFullYear();
+      m = nowJst.getUTCMonth() + 1;
+      d = nowJst.getUTCDate();
+    }
+  }
+
+  if (m === null || d === null) return "";
+
+  const tm = parseTimeFromText(t) || { hour: 18, minute: 0 };
+  const dueJst = new Date(Date.UTC(y, m - 1, d, tm.hour, tm.minute));
+
+  // If year not specified and date is in the past, roll to next year.
+  if (!/(20\d{2})/.test(t)) {
+    const nowJstDateOnly = new Date(Date.UTC(nowJst.getUTCFullYear(), nowJst.getUTCMonth(), nowJst.getUTCDate()));
+    const dueDateOnly = new Date(Date.UTC(y, m - 1, d));
+    if (dueDateOnly.getTime() < nowJstDateOnly.getTime()) {
+      dueJst.setUTCFullYear(y + 1);
+    }
+  }
+
+  return formatJst(dueJst);
+}
+
 function regexQuickParse(text) {
   const t = normalizeText(text);
 
@@ -568,13 +664,17 @@ async function parseCommandFromText(text) {
 
   // quick regex first (fast + no Vertex cost)
   const quick = regexQuickParse(stripped);
-  if (quick) return quick;
+  if (quick) {
+    const due = parseDueAtFromText(stripped);
+    if (due) quick.due_at = due;
+    return quick;
+  }
 
   // Vertex AI (Gemini)
   try {
     const obj = await vertexGenerateJson({ userText: stripped });
     // Normalize keys
-    return {
+    const cmd = {
       action: String(obj.action || "unknown"),
       task_id: String(obj.task_id || ""),
       project_id: String(obj.project_id || ""),
@@ -584,6 +684,9 @@ async function parseCommandFromText(text) {
       status: String(obj.status || ""),
       project_title: String(obj.project_title || ""),
     };
+    const due = parseDueAtFromText(stripped);
+    if (due) cmd.due_at = due;
+    return cmd;
   } catch (e) {
     console.error("vertex parse failed", e);
     // last resort: unknown
