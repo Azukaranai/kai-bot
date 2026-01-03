@@ -7,10 +7,12 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@google-cloud/cloud-sql-connector": "^1.8.5",
     "dotenv": "^17.2.3",
     "express": "^4.22.1",
     "googleapis": "^169.0.0",
     "node-fetch": "^2.7.0",
+    "pg": "^8.16.3",
     "tweetnacl": "^1.0.3"
   }
 }

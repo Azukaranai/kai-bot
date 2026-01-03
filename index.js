@@ -6,6 +6,8 @@ const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { google } = require("googleapis");
 const nacl = require("tweetnacl");
+const { Pool } = require("pg");
+const { Connector } = require("@google-cloud/cloud-sql-connector");
 
 // =====================
 // Env
@@ -29,6 +31,12 @@ const VERTEX_MODEL_ID = process.env.KAI_BOT_VERTEX_MODEL_ID || process.env.KAI_B
 // Discord
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
 const DISCORD_APP_ID = process.env.DISCORD_APP_ID;
+
+// DB (Cloud SQL Postgres)
+const DB_INSTANCE = process.env.KAI_BOT_DB_INSTANCE;
+const DB_NAME = process.env.KAI_BOT_DB_NAME || "kai_bot";
+const DB_USER = process.env.KAI_BOT_DB_USER || "kai_bot";
+const DB_PASSWORD = process.env.KAI_BOT_DB_PASSWORD;
 
 // =====================
 // Express / LINE signature verify
@@ -202,6 +210,85 @@ function clearPending(spaceId, userId) {
   if (!p) return;
   if (p.userId && userId && p.userId !== userId) return;
   _pendingBySpace.delete(spaceId);
+}
+
+// =====================
+// DB (Cloud SQL Postgres)
+// =====================
+let _dbPool = null;
+let _dbInitPromise = null;
+const _dbConnector = DB_INSTANCE ? new Connector() : null;
+
+function isDbEnabled() {
+  return !!DB_INSTANCE;
+}
+
+async function getDbPool() {
+  if (!isDbEnabled()) throw new Error("DB is not configured");
+  if (_dbPool) return _dbPool;
+  if (_dbInitPromise) return _dbInitPromise;
+
+  _dbInitPromise = (async () => {
+    const clientOpts = await _dbConnector.getOptions({ instanceConnectionName: DB_INSTANCE });
+    const pool = new Pool({
+      ...clientOpts,
+      user: DB_USER,
+      password: DB_PASSWORD,
+      database: DB_NAME,
+      max: 5,
+    });
+    await initDbSchema(pool);
+    _dbPool = pool;
+    return pool;
+  })();
+  return _dbInitPromise;
+}
+
+async function initDbSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS projects (
+      project_id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      status TEXT DEFAULT 'open',
+      due_at TEXT DEFAULT '',
+      created_at TEXT DEFAULT '',
+      created_by TEXT DEFAULT '',
+      updated_at TEXT DEFAULT '',
+      deleted_at TEXT DEFAULT ''
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tasks (
+      task_id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      project_id TEXT DEFAULT '',
+      title TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      status TEXT DEFAULT 'open',
+      due_at TEXT DEFAULT '',
+      created_at TEXT DEFAULT '',
+      done_at TEXT DEFAULT '',
+      created_by TEXT DEFAULT '',
+      updated_at TEXT DEFAULT '',
+      deleted_at TEXT DEFAULT ''
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS templates (
+      text TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      target_type TEXT DEFAULT '',
+      query TEXT DEFAULT '',
+      project_title TEXT DEFAULT '',
+      status TEXT DEFAULT '',
+      due_at TEXT DEFAULT '',
+      created_at TEXT DEFAULT ''
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tasks_space ON tasks(space_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_projects_space ON projects(space_id);`);
 }
 
 async function handlePendingText({ spaceId, userId, text, send }) {
@@ -403,6 +490,20 @@ function getSpaceId(event) {
 }
 
 async function sheetsGetTasksBySpace(spaceId, limit = 20, { includeDeleted = false } = {}) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const res = await pool.query(
+      `SELECT task_id, project_id, title, description, status, due_at, created_at, done_at, created_by, updated_at
+       FROM tasks
+       WHERE space_id = $1
+       ${includeDeleted ? "" : "AND (status IS NULL OR status <> 'deleted') AND (deleted_at IS NULL OR deleted_at = '')"}
+       ORDER BY created_at ASC
+       LIMIT $2`,
+      [String(spaceId || ""), limit]
+    );
+    return res.rows || [];
+  }
+
   const values = await sheetsGetValues("Tasks!A:Z");
   if (values.length <= 1) return [];
 
@@ -469,6 +570,20 @@ async function findTasksByQuery(spaceId, query, limit = 200) {
 }
 
 async function sheetsGetProjectsBySpace(spaceId, limit = 50, { includeDeleted = false } = {}) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const res = await pool.query(
+      `SELECT project_id, title, description, status, due_at, created_at
+       FROM projects
+       WHERE space_id = $1
+       ${includeDeleted ? "" : "AND (status IS NULL OR status <> 'deleted') AND (deleted_at IS NULL OR deleted_at = '')"}
+       ORDER BY created_at ASC
+       LIMIT $2`,
+      [String(spaceId || ""), limit]
+    );
+    return res.rows || [];
+  }
+
   const values = await sheetsGetValues("Projects!A:Z");
   if (values.length <= 1) return [];
 
@@ -522,6 +637,18 @@ async function findProjectsByQuery(spaceId, query, limit = 200) {
 }
 
 async function sheetsAppendProject({ spaceId, title, description, status, due_at, created_by }) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const now = new Date().toISOString();
+    const pid = makeId("prj");
+    await pool.query(
+      `INSERT INTO projects (project_id, space_id, title, description, status, due_at, created_at, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [pid, String(spaceId || ""), title || "", description || "", status || "open", due_at || "", now, created_by || ""]
+    );
+    return pid;
+  }
+
   const values = await sheetsGetValues("Projects!A:Z");
   if (values.length <= 0) throw new Error("Projects sheet is empty (need header row)");
 
@@ -546,6 +673,18 @@ async function sheetsAppendProject({ spaceId, title, description, status, due_at
 }
 
 async function sheetsAppendTask({ spaceId, project_id, title, description, status, due_at, created_by }) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const now = new Date().toISOString();
+    const tid = makeId("tsk");
+    await pool.query(
+      `INSERT INTO tasks (task_id, space_id, project_id, title, description, status, due_at, created_at, created_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [tid, String(spaceId || ""), project_id || "", title || "", description || "", status || "open", due_at || "", now, created_by || "", now]
+    );
+    return tid;
+  }
+
   const values = await sheetsGetValues("Tasks!A:Z");
   if (values.length <= 0) throw new Error("Tasks sheet is empty (need header row)");
 
@@ -590,6 +729,33 @@ async function sheetsFindRowById(sheetName, id, idColumnIndex = 0) {
 }
 
 async function sheetsUpdateTask(taskId, patch) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const now = new Date().toISOString();
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    const setField = (name, value) => {
+      fields.push(`${name} = $${idx++}`);
+      values.push(value);
+    };
+
+    if (patch.title !== undefined) setField("title", patch.title);
+    if (patch.description !== undefined) setField("description", patch.description);
+    if (patch.status !== undefined) setField("status", patch.status);
+    if (patch.due_at !== undefined) setField("due_at", patch.due_at);
+    if (patch.done_at !== undefined) setField("done_at", patch.done_at);
+    if (patch.project_id !== undefined) setField("project_id", patch.project_id);
+    if (patch.deleted_at !== undefined) setField("deleted_at", patch.deleted_at);
+    setField("updated_at", patch.updated_at !== undefined ? patch.updated_at : now);
+
+    if (!fields.length) return;
+    values.push(taskId);
+    await pool.query(`UPDATE tasks SET ${fields.join(", ")} WHERE task_id = $${idx}`, values);
+    return;
+  }
+
   const sheets = getSheetsClient();
 
   const values = await sheetsGetValues("Tasks!A:Z");
@@ -642,6 +808,31 @@ async function sheetsUpdateTask(taskId, patch) {
 }
 
 async function sheetsUpdateProject(projectId, patch) {
+  if (isDbEnabled()) {
+    const pool = await getDbPool();
+    const now = new Date().toISOString();
+    const fields = [];
+    const values = [];
+    let idx = 1;
+
+    const setField = (name, value) => {
+      fields.push(`${name} = $${idx++}`);
+      values.push(value);
+    };
+
+    if (patch.title !== undefined) setField("title", patch.title);
+    if (patch.description !== undefined) setField("description", patch.description);
+    if (patch.status !== undefined) setField("status", patch.status);
+    if (patch.due_at !== undefined) setField("due_at", patch.due_at);
+    if (patch.deleted_at !== undefined) setField("deleted_at", patch.deleted_at);
+    setField("updated_at", patch.updated_at !== undefined ? patch.updated_at : now);
+
+    if (!fields.length) return;
+    values.push(projectId);
+    await pool.query(`UPDATE projects SET ${fields.join(", ")} WHERE project_id = $${idx}`, values);
+    return;
+  }
+
   const sheets = getSheetsClient();
 
   const values = await sheetsGetValues("Projects!A:Z");
@@ -967,24 +1158,41 @@ async function loadTemplates() {
   if (_templateCache.data && now < _templateCache.expMs) return _templateCache.data;
 
   try {
-    const values = await sheetsGetValues("Templates!A:Z");
-    if (!values.length) return [];
-    const header = values[0].map((v) => String(v || "").trim());
-    const idx = headerIndex(header);
-    if (idx.text === undefined || idx.action === undefined) return [];
+    let data = [];
+    if (isDbEnabled()) {
+      const pool = await getDbPool();
+      const res = await pool.query(
+        "SELECT text, action, target_type, query, project_title, status, due_at FROM templates"
+      );
+      data = (res.rows || []).map((r) => ({
+        text: String(r.text || "").trim(),
+        action: String(r.action || "").trim(),
+        target_type: String(r.target_type || "").trim(),
+        query: String(r.query || "").trim(),
+        project_title: String(r.project_title || "").trim(),
+        status: String(r.status || "").trim(),
+        due_at: String(r.due_at || "").trim(),
+      }));
+    } else {
+      const values = await sheetsGetValues("Templates!A:Z");
+      if (!values.length) return [];
+      const header = values[0].map((v) => String(v || "").trim());
+      const idx = headerIndex(header);
+      if (idx.text === undefined || idx.action === undefined) return [];
 
-    const rows = values.slice(1);
-    const data = rows
-      .map((r) => ({
-        text: String(r[idx.text] || "").trim(),
-        action: String(r[idx.action] || "").trim(),
-        target_type: idx.target_type !== undefined ? String(r[idx.target_type] || "").trim() : "",
-        query: idx.query !== undefined ? String(r[idx.query] || "").trim() : "",
-        project_title: idx.project_title !== undefined ? String(r[idx.project_title] || "").trim() : "",
-        status: idx.status !== undefined ? String(r[idx.status] || "").trim() : "",
-        due_at: idx.due_at !== undefined ? String(r[idx.due_at] || "").trim() : "",
-      }))
-      .filter((r) => r.text && r.action);
+      const rows = values.slice(1);
+      data = rows
+        .map((r) => ({
+          text: String(r[idx.text] || "").trim(),
+          action: String(r[idx.action] || "").trim(),
+          target_type: idx.target_type !== undefined ? String(r[idx.target_type] || "").trim() : "",
+          query: idx.query !== undefined ? String(r[idx.query] || "").trim() : "",
+          project_title: idx.project_title !== undefined ? String(r[idx.project_title] || "").trim() : "",
+          status: idx.status !== undefined ? String(r[idx.status] || "").trim() : "",
+          due_at: idx.due_at !== undefined ? String(r[idx.due_at] || "").trim() : "",
+        }))
+        .filter((r) => r.text && r.action);
+    }
 
     _templateCache = { data, expMs: now + 60 * 1000 };
     return data;
@@ -1016,16 +1224,34 @@ async function recordTemplate(text, cmd) {
   if (templates.some((t) => t.text.toLowerCase() === key.toLowerCase())) return;
 
   try {
-    await sheetsAppendRow("Templates", [
-      key,
-      cmd.action || "",
-      cmd.target_type || "",
-      cmd.query || cmd.title || "",
-      cmd.project_title || "",
-      cmd.status || "",
-      cmd.due_at || "",
-      new Date().toISOString(),
-    ]);
+    if (isDbEnabled()) {
+      const pool = await getDbPool();
+      await pool.query(
+        `INSERT INTO templates (text, action, target_type, query, project_title, status, due_at, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          key,
+          cmd.action || "",
+          cmd.target_type || "",
+          cmd.query || cmd.title || "",
+          cmd.project_title || "",
+          cmd.status || "",
+          cmd.due_at || "",
+          new Date().toISOString(),
+        ]
+      );
+    } else {
+      await sheetsAppendRow("Templates", [
+        key,
+        cmd.action || "",
+        cmd.target_type || "",
+        cmd.query || cmd.title || "",
+        cmd.project_title || "",
+        cmd.status || "",
+        cmd.due_at || "",
+        new Date().toISOString(),
+      ]);
+    }
     _templateCache.expMs = 0;
   } catch {
     // If Templates sheet doesn't exist, ignore.
