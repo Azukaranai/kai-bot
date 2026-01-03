@@ -1438,6 +1438,9 @@ app.post("/line/webhook", async (req, res) => {
           continue;
         }
 
+        // Show processing indicator
+        await push(spaceId, [{ type: "text", text: "解釈中…" }]);
+
         // Fast path: templates/regex without LLM
         const templ = await matchTemplate(stripped);
         const fast = templ || regexQuickParse(stripped);
@@ -1447,7 +1450,6 @@ app.post("/line/webhook", async (req, res) => {
           if (due) fast.due_at = due;
           cmd = fast;
         } else {
-          if (spaceId) await push(spaceId, [{ type: "text", text: "解釈中…" }]);
           cmd = await parseCommandFromText(rawText);
         }
         console.log("parsed_command", cmd);
