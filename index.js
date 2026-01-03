@@ -268,7 +268,7 @@ function getSpaceId(event) {
   return s.groupId || s.roomId || s.userId || null;
 }
 
-async function sheetsGetTasksBySpace(spaceId, limit = 20) {
+async function sheetsGetTasksBySpace(spaceId, limit = 20, { includeDeleted = false } = {}) {
   const values = await sheetsGetValues("Tasks!A:Z");
   if (values.length <= 1) return [];
 
@@ -284,7 +284,7 @@ async function sheetsGetTasksBySpace(spaceId, limit = 20) {
   for (const r of rows) {
     const rSid = String(r[idx.group_id] || "").trim();
     if (rSid !== sid) continue;
-    out.push({
+    const row = {
       task_id: r[idx.task_id] || "",
       project_id: idx.project_id !== undefined ? r[idx.project_id] || "" : "",
       title: r[idx.title] || "",
@@ -295,20 +295,32 @@ async function sheetsGetTasksBySpace(spaceId, limit = 20) {
       done_at: idx.done_at !== undefined ? r[idx.done_at] || "" : "",
       created_by: idx.created_by !== undefined ? r[idx.created_by] || "" : "",
       updated_at: idx.updated_at !== undefined ? r[idx.updated_at] || "" : "",
-    });
+    };
+    if (!includeDeleted && String(row.status || "").toLowerCase() === "deleted") continue;
+    out.push(row);
     if (out.length >= limit) break;
   }
   return out;
 }
 
+function formatStatusJa(status) {
+  const s = String(status || "").toLowerCase();
+  if (s === "open") return "未着手";
+  if (s === "doing") return "進行中";
+  if (s === "done") return "完了";
+  if (s === "deleted") return "削除";
+  return status || "未設定";
+}
+
 function formatTaskList(tasks) {
   if (!tasks.length) return "このスペースのタスクはまだありません。";
   const lines = tasks.map((t, i) => {
-    const due = t.due_at ? `期限: ${t.due_at}` : "期限: なし";
-    const st = t.status ? `status: ${t.status}` : "status: (未設定)";
-    return `${i + 1}. ${t.title} / ${due} / ${st}`;
+    const due = t.due_at ? t.due_at : "未設定";
+    const st = formatStatusJa(t.status);
+    const parts = [`${i + 1}. ${t.title}`, `期限: ${due}`, `状態: ${st}`];
+    return parts.join("\n");
   });
-  return lines.join("\n");
+  return lines.join("\n\n");
 }
 
 async function findTasksByQuery(spaceId, query, limit = 200) {
@@ -354,11 +366,12 @@ function formatProjectList(projects) {
   if (!projects.length) return "このスペースのプロジェクトはまだありません。";
   return projects
     .map((p, i) => {
-      const st = p.status ? `status: ${p.status}` : "status: (未設定)";
-      const due = p.due_at ? `期限: ${p.due_at}` : "期限: なし";
-      return `${i + 1}. ${p.title} / ${due} / ${st}`;
+      const st = formatStatusJa(p.status);
+      const due = p.due_at ? p.due_at : "未設定";
+      const parts = [`${i + 1}. ${p.title}`, `期限: ${due}`, `状態: ${st}`];
+      return parts.join("\n");
     })
-    .join("\n");
+    .join("\n\n");
 }
 
 async function findProjectsByQuery(spaceId, query, limit = 200) {
