@@ -22,8 +22,8 @@ const VERTEX_PROJECT =
   process.env.GOOGLE_CLOUD_PROJECT ||
   process.env.GCLOUD_PROJECT ||
   process.env.GCP_PROJECT;
-const VERTEX_LOCATION = process.env.KAI_BOT_VERTEX_LOCATION || "global";
-const VERTEX_MODEL_ID = process.env.KAI_BOT_VERTEX_MODEL_ID || "gemini-2.5-flash";
+const VERTEX_LOCATION = process.env.KAI_BOT_VERTEX_LOCATION || process.env.KAI_BOT_GCP_LOCATION || "global";
+const VERTEX_MODEL_ID = process.env.KAI_BOT_VERTEX_MODEL_ID || process.env.KAI_BOT_GEMINI_MODEL || "gemini-2.5-flash";
 
 // =====================
 // Express / LINE signature verify
