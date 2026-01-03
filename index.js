@@ -141,25 +141,34 @@ function stripTriggerPrefix(text) {
 // =====================
 // Pending actions (follow-up prompts)
 // =====================
-const _pendingBySpace = new Map();
-function getPending(spaceId) {
-  const p = _pendingBySpace.get(spaceId);
+const _pendingByKey = new Map();
+function pendingKey(spaceId, userId) {
+  if (!spaceId || !userId) return null;
+  return `${spaceId}:${userId}`;
+}
+
+function getPending(spaceId, userId) {
+  const key = pendingKey(spaceId, userId);
+  if (!key) return null;
+  const p = _pendingByKey.get(key);
   if (!p) return null;
   if (Date.now() > p.expiresAt) {
-    _pendingBySpace.delete(spaceId);
+    _pendingByKey.delete(key);
     return null;
   }
   return p;
 }
 
-function setPending(spaceId, pending, ttlMs = 5 * 60 * 1000) {
-  if (!spaceId) return;
-  _pendingBySpace.set(spaceId, { ...pending, expiresAt: Date.now() + ttlMs });
+function setPending(spaceId, userId, pending, ttlMs = 5 * 60 * 1000) {
+  const key = pendingKey(spaceId, userId);
+  if (!key) return;
+  _pendingByKey.set(key, { ...pending, expiresAt: Date.now() + ttlMs });
 }
 
-function clearPending(spaceId) {
-  if (!spaceId) return;
-  _pendingBySpace.delete(spaceId);
+function clearPending(spaceId, userId) {
+  const key = pendingKey(spaceId, userId);
+  if (!key) return;
+  _pendingByKey.delete(key);
 }
 
 // =====================
@@ -1153,13 +1162,15 @@ app.post("/line/webhook", async (req, res) => {
         const triggered = isTriggeredText(rawText);
         console.log("trigger_check", { triggered, textPreview: rawText.slice(0, 200) });
 
+        const userId = src.userId || "";
+
         if (!triggered) {
-          if (spaceId) {
-            const pending = getPending(spaceId);
+          if (spaceId && userId) {
+            const pending = getPending(spaceId, userId);
             if (pending) {
               const followText = normalizeText(rawText);
               if (/^(キャンセル|やめる|中止)$/i.test(followText)) {
-                clearPending(spaceId);
+                clearPending(spaceId, userId);
                 await reply(event.replyToken, [{ type: "text", text: "キャンセルしました。" }]);
                 continue;
               }
@@ -1180,7 +1191,7 @@ app.post("/line/webhook", async (req, res) => {
                 await push(spaceId, [{ type: "text", text: "削除中…" }]);
                 await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
                 await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
-                clearPending(spaceId);
+                clearPending(spaceId, userId);
                 continue;
               }
 
@@ -1199,7 +1210,7 @@ app.post("/line/webhook", async (req, res) => {
                 await push(spaceId, [{ type: "text", text: "削除中…" }]);
                 await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
                 await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
-                clearPending(spaceId);
+                clearPending(spaceId, userId);
                 continue;
               }
             }
@@ -1214,14 +1225,14 @@ app.post("/line/webhook", async (req, res) => {
           continue;
         }
 
-        const pending = spaceId ? getPending(spaceId) : null;
+        const pending = spaceId && userId ? getPending(spaceId, userId) : null;
         if (pending) {
           // If the user replied with just a name, treat as follow-up.
           const hasActionKeyword = /(削除|消して|消す|取り消し|完了|終わった|再開|更新|変更|修正|追加|作成|一覧)/.test(stripped);
           if (!hasActionKeyword) {
             const followText = normalizeText(stripped);
             if (/^(キャンセル|やめる|中止)$/i.test(followText)) {
-              clearPending(spaceId);
+              clearPending(spaceId, userId);
               await reply(event.replyToken, [{ type: "text", text: "キャンセルしました。" }]);
               continue;
             }
@@ -1243,7 +1254,7 @@ app.post("/line/webhook", async (req, res) => {
               });
               await push(spaceId, [{ type: "text", text: buildCreatedSummary("タスク", { title, status: "open" }) }]);
               await push(spaceId, [{ type: "text", text: "未設定: 期限 / 詳細 / プロジェクト" }]);
-              clearPending(spaceId);
+              clearPending(spaceId, userId);
               continue;
             }
             if (pending.action === "create_project") {
@@ -1263,7 +1274,7 @@ app.post("/line/webhook", async (req, res) => {
               });
               await push(spaceId, [{ type: "text", text: buildCreatedSummary("プロジェクト", { title, status: "open" }) }]);
               await push(spaceId, [{ type: "text", text: "未設定: 期限 / 詳細" }]);
-              clearPending(spaceId);
+              clearPending(spaceId, userId);
               continue;
             }
             if (pending.action === "delete_task") {
@@ -1281,7 +1292,7 @@ app.post("/line/webhook", async (req, res) => {
               await push(spaceId, [{ type: "text", text: "削除中…" }]);
               await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
               await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
-              clearPending(spaceId);
+              clearPending(spaceId, userId);
               continue;
             }
             if (pending.action === "delete_project") {
@@ -1299,13 +1310,13 @@ app.post("/line/webhook", async (req, res) => {
               await push(spaceId, [{ type: "text", text: "削除中…" }]);
               await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
               await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
-              clearPending(spaceId);
+              clearPending(spaceId, userId);
               continue;
             }
           }
         }
 
-        if (spaceId) clearPending(spaceId);
+        if (spaceId && userId) clearPending(spaceId, userId);
 
         if (!spaceId) {
           await reply(event.replyToken, [{ type: "text", text: "スペースIDが取得できませんでした（source）。" }]);
@@ -1326,7 +1337,7 @@ app.post("/line/webhook", async (req, res) => {
           const question = cmd.question || "対象を教えてください。";
           await push(spaceId, [{ type: "text", text: question }]);
           const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
-          setPending(spaceId, { action: pendingAction });
+          setPending(spaceId, userId, { action: pendingAction });
           continue;
         }
 
@@ -1335,13 +1346,13 @@ app.post("/line/webhook", async (req, res) => {
           if (intent.action === "delete" && intent.targetType && intent.missingTarget) {
             const q = intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？";
             await push(spaceId, [{ type: "text", text: q }]);
-            setPending(spaceId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
+            setPending(spaceId, userId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
             continue;
           }
           if (intent.action === "create" && intent.targetType) {
             const q = intent.targetType === "project" ? "追加するプロジェクト名を教えてください。" : "追加するタスク名を教えてください。";
             await push(spaceId, [{ type: "text", text: q }]);
-            setPending(spaceId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
+            setPending(spaceId, userId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
             continue;
           }
           await push(spaceId, [{ type: "text", text: buildUnknownResponse(stripped, intent) }]);
@@ -1413,7 +1424,7 @@ app.post("/line/webhook", async (req, res) => {
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
             await push(spaceId, [{ type: "text", text: "どのタスクを削除しますか？" }]);
-            setPending(spaceId, { action: "delete_task" });
+            setPending(spaceId, userId, { action: "delete_task" });
             continue;
           }
           const items = splitQueries(q);
@@ -1538,7 +1549,7 @@ app.post("/line/webhook", async (req, res) => {
           const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
           if (!q) {
             await push(spaceId, [{ type: "text", text: "どのプロジェクトを削除しますか？" }]);
-            setPending(spaceId, { action: "delete_project" });
+            setPending(spaceId, userId, { action: "delete_project" });
             continue;
           }
           const items = splitQueries(q);
