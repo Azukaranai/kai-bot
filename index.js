@@ -1190,7 +1190,7 @@ app.post("/line/webhook", async (req, res) => {
                 }
                 await push(spaceId, [{ type: "text", text: "削除中…" }]);
                 await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
-                await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
+                await push(spaceId, [{ type: "text", text: `タスクを削除しました: ${matches[0].title}` }]);
                 clearPending(spaceId, userId);
                 continue;
               }
@@ -1291,7 +1291,7 @@ app.post("/line/webhook", async (req, res) => {
               }
               await push(spaceId, [{ type: "text", text: "削除中…" }]);
               await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
-              await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
+              await push(spaceId, [{ type: "text", text: `タスクを削除しました: ${matches[0].title}` }]);
               clearPending(spaceId, userId);
               continue;
             }
@@ -1445,7 +1445,7 @@ app.post("/line/webhook", async (req, res) => {
             deleted.push(matches[0].title);
           }
           if (deleted.length) {
-            await push(spaceId, [{ type: "text", text: `削除扱いにしました: ${deleted.join("、")}` }]);
+            await push(spaceId, [{ type: "text", text: `削除しました: ${deleted.join("、")}` }]);
           }
           continue;
         }
