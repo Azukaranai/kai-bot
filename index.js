@@ -657,6 +657,14 @@ function splitQueries(text) {
     .filter(Boolean);
 }
 
+function sanitizeQuery(text) {
+  let t = normalizeText(text);
+  if (!t) return "";
+  t = t.replace(/^[「『"“](.+)[」』"”]$/, "$1");
+  t = t.replace(/(を|は|が|の|です|だ|よ|ね)\s*$/g, "");
+  return t.trim();
+}
+
 function inferIntentFromText(text) {
   const t = normalizeText(text);
   const hasTask = /タスク|task/i.test(t);
@@ -1284,7 +1292,7 @@ app.post("/line/webhook", async (req, res) => {
 
               const query = followText;
               if (pending.action === "delete_task") {
-                const matches = await findTasksByQuery(spaceId, query, 200);
+                const matches = await findTasksByQuery(spaceId, sanitizeQuery(query), 200);
                 if (!matches.length) {
                   await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。もう一度教えてください。" }]);
                   continue;
@@ -1303,7 +1311,7 @@ app.post("/line/webhook", async (req, res) => {
               }
 
               if (pending.action === "delete_project") {
-                const matches = await findProjectsByQuery(spaceId, query, 200);
+                const matches = await findProjectsByQuery(spaceId, sanitizeQuery(query), 200);
                 if (!matches.length) {
                   await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。もう一度教えてください。" }]);
                   continue;
@@ -1385,7 +1393,7 @@ app.post("/line/webhook", async (req, res) => {
               continue;
             }
             if (pending.action === "delete_task") {
-              const matches = await findTasksByQuery(spaceId, followText, 200);
+            const matches = await findTasksByQuery(spaceId, sanitizeQuery(followText), 200);
               if (!matches.length) {
                 await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。もう一度教えてください。" }]);
                 continue;
@@ -1403,7 +1411,7 @@ app.post("/line/webhook", async (req, res) => {
               continue;
             }
             if (pending.action === "delete_project") {
-              const matches = await findProjectsByQuery(spaceId, followText, 200);
+              const matches = await findProjectsByQuery(spaceId, sanitizeQuery(followText), 200);
               if (!matches.length) {
                 await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。もう一度教えてください。" }]);
                 continue;
@@ -1542,7 +1550,7 @@ app.post("/line/webhook", async (req, res) => {
             setPending(spaceId, userId, { action: "delete_task" });
             continue;
           }
-          const items = splitQueries(q);
+          const items = splitQueries(q).map(sanitizeQuery).filter(Boolean);
           const deleted = [];
           for (const item of items) {
             const matches = await findTasksByQuery(spaceId, item, 200);
@@ -1681,7 +1689,7 @@ app.post("/line/webhook", async (req, res) => {
             setPending(spaceId, userId, { action: "delete_project" });
             continue;
           }
-          const items = splitQueries(q);
+          const items = splitQueries(q).map(sanitizeQuery).filter(Boolean);
           const deleted = [];
           for (const item of items) {
             const matches = await findProjectsByQuery(spaceId, item, 200);
