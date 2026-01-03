@@ -630,6 +630,13 @@ function extractQueryFromText(text, removePatterns = []) {
   return t;
 }
 
+function splitQueries(text) {
+  return String(text || "")
+    .split(/[、,，\n]/)
+    .map((s) => normalizeText(s))
+    .filter(Boolean);
+}
+
 function extractQuotedText(text) {
   const t = String(text || "");
   const m = t.match(/[「『"“](.+?)[」』"”]/);
@@ -1145,14 +1152,64 @@ app.post("/line/webhook", async (req, res) => {
           continue;
         }
 
-        if (spaceId) clearPending(spaceId);
-
         // If user only called bot, show menu.
         const stripped = stripTriggerPrefix(rawText);
         if (!stripped) {
           await reply(event.replyToken, [buildMenuFlex()]);
           continue;
         }
+
+        const pending = spaceId ? getPending(spaceId) : null;
+        if (pending) {
+          // If the user replied with just a name, treat as follow-up.
+          const hasActionKeyword = /(削除|消して|消す|取り消し|完了|終わった|再開|更新|変更|修正|追加|作成|一覧)/.test(stripped);
+          if (!hasActionKeyword) {
+            const followText = normalizeText(stripped);
+            if (/^(キャンセル|やめる|中止)$/i.test(followText)) {
+              clearPending(spaceId);
+              await reply(event.replyToken, [{ type: "text", text: "キャンセルしました。" }]);
+              continue;
+            }
+            if (pending.action === "delete_task") {
+              const matches = await findTasksByQuery(spaceId, followText, 200);
+              if (!matches.length) {
+                await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。もう一度教えてください。" }]);
+                continue;
+              }
+              if (matches.length > 1) {
+                await reply(event.replyToken, [
+                  { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}` },
+                ]);
+                continue;
+              }
+              await push(spaceId, [{ type: "text", text: "削除中…" }]);
+              await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+              await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
+              clearPending(spaceId);
+              continue;
+            }
+            if (pending.action === "delete_project") {
+              const matches = await findProjectsByQuery(spaceId, followText, 200);
+              if (!matches.length) {
+                await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。もう一度教えてください。" }]);
+                continue;
+              }
+              if (matches.length > 1) {
+                await reply(event.replyToken, [
+                  { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}` },
+                ]);
+                continue;
+              }
+              await push(spaceId, [{ type: "text", text: "削除中…" }]);
+              await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
+              await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
+              clearPending(spaceId);
+              continue;
+            }
+          }
+        }
+
+        if (spaceId) clearPending(spaceId);
 
         if (!spaceId) {
           await reply(event.replyToken, [{ type: "text", text: "スペースIDが取得できませんでした（source）。" }]);
@@ -1245,20 +1302,26 @@ app.post("/line/webhook", async (req, res) => {
             setPending(spaceId, { action: "delete_task" });
             continue;
           }
-          const matches = await findTasksByQuery(spaceId, q, 200);
-          if (!matches.length) {
-            await push(spaceId, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
-            continue;
+          const items = splitQueries(q);
+          const deleted = [];
+          for (const item of items) {
+            const matches = await findTasksByQuery(spaceId, item, 200);
+            if (!matches.length) {
+              await push(spaceId, [{ type: "text", text: `一致するタスクが見つかりませんでした: ${item}` }]);
+              continue;
+            }
+            if (matches.length > 1) {
+              await push(spaceId, [
+                { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}` },
+              ]);
+              continue;
+            }
+            await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+            deleted.push(matches[0].title);
           }
-          if (matches.length > 1) {
-            await push(spaceId, [
-              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
-            ]);
-            continue;
+          if (deleted.length) {
+            await push(spaceId, [{ type: "text", text: `削除扱いにしました: ${deleted.join("、")}` }]);
           }
-          await push(spaceId, [{ type: "text", text: "削除中…" }]);
-          await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
-          await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
           continue;
         }
 
@@ -1364,20 +1427,26 @@ app.post("/line/webhook", async (req, res) => {
             setPending(spaceId, { action: "delete_project" });
             continue;
           }
-          const matches = await findProjectsByQuery(spaceId, q, 200);
-          if (!matches.length) {
-            await push(spaceId, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
-            continue;
+          const items = splitQueries(q);
+          const deleted = [];
+          for (const item of items) {
+            const matches = await findProjectsByQuery(spaceId, item, 200);
+            if (!matches.length) {
+              await push(spaceId, [{ type: "text", text: `一致するプロジェクトが見つかりませんでした: ${item}` }]);
+              continue;
+            }
+            if (matches.length > 1) {
+              await push(spaceId, [
+                { type: "text", text: `複数見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}` },
+              ]);
+              continue;
+            }
+            await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
+            deleted.push(matches[0].title);
           }
-          if (matches.length > 1) {
-            await push(spaceId, [
-              { type: "text", text: `複数見つかりました。idで指定してください:\n${formatProjectMatches(matches)}` },
-            ]);
-            continue;
+          if (deleted.length) {
+            await push(spaceId, [{ type: "text", text: `削除扱いにしました: ${deleted.join("、")}` }]);
           }
-          await push(spaceId, [{ type: "text", text: "削除中…" }]);
-          await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
-          await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
           continue;
         }
 
