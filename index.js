@@ -282,8 +282,7 @@ function formatTaskList(tasks) {
   const lines = tasks.map((t, i) => {
     const due = t.due_at ? `期限: ${t.due_at}` : "期限: なし";
     const st = t.status ? `status: ${t.status}` : "status: (未設定)";
-    const id = t.task_id ? `id: ${t.task_id}` : "";
-    return `${i + 1}. ${t.title} / ${due} / ${st}${id ? ` / ${id}` : ""}`;
+    return `${i + 1}. ${t.title} / ${due} / ${st}`;
   });
   return lines.join("\n");
 }
@@ -333,7 +332,7 @@ function formatProjectList(projects) {
     .map((p, i) => {
       const st = p.status ? `status: ${p.status}` : "status: (未設定)";
       const due = p.due_at ? `期限: ${p.due_at}` : "期限: なし";
-      return `${i + 1}. ${p.title} / ${due} / ${st} / id: ${p.project_id}`;
+      return `${i + 1}. ${p.title} / ${due} / ${st}`;
     })
     .join("\n");
 }
@@ -881,6 +880,15 @@ function formatProjectMatches(projects) {
     .join("\n");
 }
 
+function buildCreatedSummary(kind, item) {
+  const lines = [`${kind}を追加しました: ${item.title}`];
+  if (item.project_title) lines.push(`プロジェクト: ${item.project_title}`);
+  if (item.due_at) lines.push(`期限: ${item.due_at}`);
+  if (item.status) lines.push(`status: ${item.status}`);
+  if (item.description) lines.push(`詳細: ${item.description}`);
+  return lines.join("\n");
+}
+
 // =====================
 // Postback data parsing
 // =====================
@@ -1007,98 +1015,102 @@ app.post("/line/webhook", async (req, res) => {
           continue;
         }
 
-        // Parse command (regex fast path + Vertex AI fallback)
-        const cmd = await parseCommandFromText(rawText);
-        console.log("parsed_command", cmd);
-
-        // Execute
         if (!spaceId) {
           await reply(event.replyToken, [{ type: "text", text: "スペースIDが取得できませんでした（source）。" }]);
           continue;
         }
 
+        // Immediate ack to reduce uncertainty
+        await reply(event.replyToken, [{ type: "text", text: "解釈中…（少し待ってね）" }]);
+
+        // Parse command (regex fast path + Vertex AI fallback)
+        const cmd = await parseCommandFromText(rawText);
+        console.log("parsed_command", cmd);
+
+        // Execute (push results)
         const createdBy = src.userId || "";
 
         if (cmd.action === "help") {
-          await reply(event.replyToken, [buildMenuFlex()]);
+          await push(spaceId, [buildMenuFlex()]);
           continue;
         }
 
         if (cmd.action === "list_tasks") {
           const tasks = await sheetsGetTasksBySpace(spaceId, 20);
-          await reply(event.replyToken, [{ type: "text", text: formatTaskList(tasks) }]);
+          await push(spaceId, [{ type: "text", text: formatTaskList(tasks) }]);
           continue;
         }
 
         if (cmd.action === "list_projects") {
           const projects = await sheetsGetProjectsBySpace(spaceId, 50);
-          await reply(event.replyToken, [{ type: "text", text: formatProjectList(projects) }]);
+          await push(spaceId, [{ type: "text", text: formatProjectList(projects) }]);
           continue;
         }
 
         if (cmd.action === "complete_task") {
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "完了にするタスクが見つかりません。例: @KAI bot 議事録のタスク終わったよ / タスク完了 tsk_xxx" }]);
+            await push(spaceId, [{ type: "text", text: "完了にするタスクが見つかりません。例: @KAI bot 議事録のタスク終わったよ / タスク完了 tsk_xxx" }]);
             continue;
           }
           const matches = await findTasksByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
             ]);
             continue;
           }
           await sheetsUpdateTask(matches[0].task_id, { status: "done", done_at: new Date().toISOString() });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを完了にしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          await push(spaceId, [{ type: "text", text: `タスクを完了にしました: ${matches[0].title}` }]);
           continue;
         }
 
         if (cmd.action === "reopen_task") {
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "再開するタスクが見つかりません。例: @KAI bot 議事録のタスク再開 / タスク再開 tsk_xxx" }]);
+            await push(spaceId, [{ type: "text", text: "再開するタスクが見つかりません。例: @KAI bot 議事録のタスク再開 / タスク再開 tsk_xxx" }]);
             continue;
           }
           const matches = await findTasksByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
             ]);
             continue;
           }
           await sheetsUpdateTask(matches[0].task_id, { status: "open", done_at: "" });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを再開にしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          await push(spaceId, [{ type: "text", text: `タスクを再開にしました: ${matches[0].title}` }]);
           continue;
         }
 
         if (cmd.action === "delete_task") {
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "削除するタスクが見つかりません。例: @KAI bot 議事録のタスク削除 / タスク削除 tsk_xxx" }]);
+            await push(spaceId, [{ type: "text", text: "削除するタスクが見つかりません。例: @KAI bot 議事録のタスク削除 / タスク削除 tsk_xxx" }]);
             continue;
           }
           const matches = await findTasksByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
             ]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "削除中…" }]);
           await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          await push(spaceId, [{ type: "text", text: `タスクを削除扱いにしました: ${matches[0].title}` }]);
           continue;
         }
 
@@ -1112,35 +1124,37 @@ app.post("/line/webhook", async (req, res) => {
 
           const q = cmd.task_id || cmd.query || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "編集するタスクが見つかりません。例: @KAI bot 議事録の期限を明日18時に変更" }]);
+            await push(spaceId, [{ type: "text", text: "編集するタスクが見つかりません。例: @KAI bot 議事録の期限を明日18時に変更" }]);
             continue;
           }
           if (Object.keys(patch).length === 0) {
-            await reply(event.replyToken, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
+            await push(spaceId, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
             continue;
           }
           const matches = await findTasksByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するタスクが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatTaskMatches(matches)}` },
             ]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "更新中…" }]);
           await sheetsUpdateTask(matches[0].task_id, patch);
-          await reply(event.replyToken, [{ type: "text", text: `タスクを更新しました: ${matches[0].title} (id: ${matches[0].task_id})` }]);
+          await push(spaceId, [{ type: "text", text: `タスクを更新しました: ${matches[0].title}` }]);
           continue;
         }
 
         if (cmd.action === "create_project") {
           const title = (cmd.title || cmd.project_title || "").trim();
           if (!title) {
-            await reply(event.replyToken, [{ type: "text", text: "プロジェクト名が分かりません。例: @KAI bot プロジェクト『卒論』を追加" }]);
+            await push(spaceId, [{ type: "text", text: "プロジェクト名が分かりません。例: @KAI bot プロジェクト『卒論』を追加" }]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "追加中…" }]);
           const pid = await sheetsAppendProject({
             spaceId,
             title,
@@ -1149,7 +1163,9 @@ app.post("/line/webhook", async (req, res) => {
             due_at: cmd.due_at || "",
             created_by: createdBy,
           });
-          await reply(event.replyToken, [{ type: "text", text: `プロジェクトを追加しました: ${title}\nid: ${pid}` }]);
+          await push(spaceId, [
+            { type: "text", text: buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }) },
+          ]);
           continue;
         }
 
@@ -1162,57 +1178,60 @@ app.post("/line/webhook", async (req, res) => {
 
           const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "編集するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクトの期限を3/1に変更" }]);
+            await push(spaceId, [{ type: "text", text: "編集するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクトの期限を3/1に変更" }]);
             continue;
           }
           if (Object.keys(patch).length === 0) {
-            await reply(event.replyToken, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
+            await push(spaceId, [{ type: "text", text: "更新内容が見つかりませんでした（期限/ステータス/内容/タイトル）。" }]);
             continue;
           }
           const matches = await findProjectsByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatProjectMatches(matches)}` },
             ]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "更新中…" }]);
           await sheetsUpdateProject(matches[0].project_id, patch);
-          await reply(event.replyToken, [{ type: "text", text: `プロジェクトを更新しました: ${matches[0].title} (id: ${matches[0].project_id})` }]);
+          await push(spaceId, [{ type: "text", text: `プロジェクトを更新しました: ${matches[0].title}` }]);
           continue;
         }
 
         if (cmd.action === "delete_project") {
           const q = cmd.project_id || cmd.query || cmd.project_title || cmd.title;
           if (!q) {
-            await reply(event.replyToken, [{ type: "text", text: "削除するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクト削除" }]);
+            await push(spaceId, [{ type: "text", text: "削除するプロジェクトが見つかりません。例: @KAI bot 卒論プロジェクト削除" }]);
             continue;
           }
           const matches = await findProjectsByQuery(spaceId, q, 200);
           if (!matches.length) {
-            await reply(event.replyToken, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
+            await push(spaceId, [{ type: "text", text: "一致するプロジェクトが見つかりませんでした。" }]);
             continue;
           }
           if (matches.length > 1) {
-            await reply(event.replyToken, [
+            await push(spaceId, [
               { type: "text", text: `複数見つかりました。idで指定してください:\n${formatProjectMatches(matches)}` },
             ]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "削除中…" }]);
           await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
-          await reply(event.replyToken, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title} (id: ${matches[0].project_id})` }]);
+          await push(spaceId, [{ type: "text", text: `プロジェクトを削除扱いにしました: ${matches[0].title}` }]);
           continue;
         }
 
         if (cmd.action === "create_task") {
           const title = (cmd.title || "").trim();
           if (!title) {
-            await reply(event.replyToken, [{ type: "text", text: "タスク名が分かりません。例: @KAI bot 議事録作成を明日18時までに追加" }]);
+            await push(spaceId, [{ type: "text", text: "タスク名が分かりません。例: @KAI bot 議事録作成を明日18時までに追加" }]);
             continue;
           }
+          await push(spaceId, [{ type: "text", text: "追加中…" }]);
           const tid = await sheetsAppendTask({
             spaceId,
             project_id: cmd.project_id || "",
@@ -1222,12 +1241,14 @@ app.post("/line/webhook", async (req, res) => {
             due_at: cmd.due_at || "",
             created_by: createdBy,
           });
-          await reply(event.replyToken, [{ type: "text", text: `タスクを追加しました: ${title}\nid: ${tid}` }]);
+          await push(spaceId, [
+            { type: "text", text: buildCreatedSummary("タスク", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "", project_title: cmd.project_title || "" }) },
+          ]);
           continue;
         }
 
         // Unknown -> show menu + hint
-        await reply(event.replyToken, [
+        await push(spaceId, [
           { type: "text", text: "解釈できませんでした。例: ‘議事録作成を明日18時までに追加’ / ‘タスク一覧’ / ‘タスク完了 tsk_xxx’" },
           buildMenuFlex(),
         ]);
