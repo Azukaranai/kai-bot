@@ -675,7 +675,7 @@ function inferIntentFromText(text) {
 }
 
 function buildUnknownResponse(text, intent) {
-  const lines = ["ごめん、全部は理解できなかった。"];
+  const lines = ["申し訳ありません。内容を十分に理解できませんでした。"];
   const understood = [];
   if (intent.action) understood.push(`意図: ${intent.action}`);
   if (intent.targetType) understood.push(`対象: ${intent.targetType}`);
@@ -688,7 +688,7 @@ function buildUnknownResponse(text, intent) {
   if (intent.missingTarget) missing.push("対象の名前");
   if (missing.length) lines.push(`足りないこと: ${missing.join(" / ")}`);
 
-  lines.push("例: タスクを削除 → 『議事録』とだけ送る / タスク完了 〇〇 / プロジェクト追加 卒論");
+  lines.push("例: タスク追加 企画書作成 / タスク完了 議事録 / プロジェクト追加 卒論");
   return lines.join("\n");
 }
 
@@ -1028,10 +1028,10 @@ function buildMissingNotes(text, cmd) {
 }
 
 function buildCreatedSummary(kind, item) {
-  const lines = [`${kind}を追加しました: ${item.title}`];
+  const lines = [`${kind}を追加しました。`, `名前: ${item.title}`];
   if (item.project_title) lines.push(`プロジェクト: ${item.project_title}`);
   if (item.due_at) lines.push(`期限: ${item.due_at}`);
-  if (item.status) lines.push(`status: ${item.status}`);
+  if (item.status) lines.push(`状態: ${formatStatusJa(item.status)}`);
   if (item.description) lines.push(`詳細: ${item.description}`);
   return lines.join("\n");
 }
@@ -1225,6 +1225,47 @@ app.post("/line/webhook", async (req, res) => {
               await reply(event.replyToken, [{ type: "text", text: "キャンセルしました。" }]);
               continue;
             }
+            if (pending.action === "create_task") {
+              const title = followText;
+              if (!title) {
+                await reply(event.replyToken, [{ type: "text", text: "タスク名が分かりません。もう一度教えてください。" }]);
+                continue;
+              }
+              await push(spaceId, [{ type: "text", text: "追加中…" }]);
+              const tid = await sheetsAppendTask({
+                spaceId,
+                project_id: "",
+                title,
+                description: "",
+                status: "open",
+                due_at: "",
+                created_by: src.userId || "",
+              });
+              await push(spaceId, [{ type: "text", text: buildCreatedSummary("タスク", { title, status: "open" }) }]);
+              await push(spaceId, [{ type: "text", text: "未設定: 期限 / 詳細 / プロジェクト" }]);
+              clearPending(spaceId);
+              continue;
+            }
+            if (pending.action === "create_project") {
+              const title = followText;
+              if (!title) {
+                await reply(event.replyToken, [{ type: "text", text: "プロジェクト名が分かりません。もう一度教えてください。" }]);
+                continue;
+              }
+              await push(spaceId, [{ type: "text", text: "追加中…" }]);
+              const pid = await sheetsAppendProject({
+                spaceId,
+                title,
+                description: "",
+                status: "open",
+                due_at: "",
+                created_by: src.userId || "",
+              });
+              await push(spaceId, [{ type: "text", text: buildCreatedSummary("プロジェクト", { title, status: "open" }) }]);
+              await push(spaceId, [{ type: "text", text: "未設定: 期限 / 詳細" }]);
+              clearPending(spaceId);
+              continue;
+            }
             if (pending.action === "delete_task") {
               const matches = await findTasksByQuery(spaceId, followText, 200);
               if (!matches.length) {
@@ -1295,6 +1336,12 @@ app.post("/line/webhook", async (req, res) => {
             const q = intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？";
             await push(spaceId, [{ type: "text", text: q }]);
             setPending(spaceId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
+            continue;
+          }
+          if (intent.action === "create" && intent.targetType) {
+            const q = intent.targetType === "project" ? "追加するプロジェクト名を教えてください。" : "追加するタスク名を教えてください。";
+            await push(spaceId, [{ type: "text", text: q }]);
+            setPending(spaceId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
             continue;
           }
           await push(spaceId, [{ type: "text", text: buildUnknownResponse(stripped, intent) }]);
