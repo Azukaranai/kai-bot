@@ -1,0 +1,14 @@
+{
+  "name": "line-webhook",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.22.1",
+    "googleapis": "^169.0.0",
+    "node-fetch": "^2.7.0"
+  }
+}
