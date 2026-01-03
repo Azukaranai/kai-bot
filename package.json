@@ -10,6 +10,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.22.1",
     "googleapis": "^169.0.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "tweetnacl": "^1.0.3"
   }
 }

@@ -5,6 +5,7 @@ const express = require("express");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { google } = require("googleapis");
+const nacl = require("tweetnacl");
 
 // =====================
 // Env
@@ -24,6 +25,10 @@ const VERTEX_PROJECT =
   process.env.GCP_PROJECT;
 const VERTEX_LOCATION = process.env.KAI_BOT_VERTEX_LOCATION || process.env.KAI_BOT_GCP_LOCATION || "global";
 const VERTEX_MODEL_ID = process.env.KAI_BOT_VERTEX_MODEL_ID || process.env.KAI_BOT_GEMINI_MODEL || "gemini-2.5-flash";
+
+// Discord
+const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
+const DISCORD_APP_ID = process.env.DISCORD_APP_ID;
 
 // =====================
 // Express / LINE signature verify
@@ -115,6 +120,38 @@ async function getLineDisplayName(source) {
 }
 
 // =====================
+// Discord helpers
+// =====================
+function verifyDiscordSignature(req) {
+  const signature = req.get("x-signature-ed25519");
+  const timestamp = req.get("x-signature-timestamp");
+  if (!signature || !timestamp || !DISCORD_PUBLIC_KEY || !req.rawBody) return false;
+
+  const message = Buffer.concat([Buffer.from(timestamp), Buffer.from(req.rawBody)]);
+  const sig = Buffer.from(signature, "hex");
+  const pub = Buffer.from(DISCORD_PUBLIC_KEY, "hex");
+  return nacl.sign.detached.verify(message, sig, pub);
+}
+
+async function discordFollowup(appId, token, content) {
+  if (!appId || !token) return;
+  await fetch(`https://discord.com/api/v10/webhooks/${appId}/${token}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+function getDiscordUserId(interaction) {
+  const u = (interaction.member && interaction.member.user) || interaction.user || {};
+  return u.id || "";
+}
+
+function getDiscordSpaceId(interaction) {
+  return interaction.guild_id || interaction.channel_id || getDiscordUserId(interaction) || null;
+}
+
+// =====================
 // Trigger: KAI bot official name
 // =====================
 // Spec (per your requirement)
@@ -165,6 +202,98 @@ function clearPending(spaceId, userId) {
   if (!p) return;
   if (p.userId && userId && p.userId !== userId) return;
   _pendingBySpace.delete(spaceId);
+}
+
+async function handlePendingText({ spaceId, userId, text, send }) {
+  if (!spaceId || !userId) return false;
+  const pending = getPending(spaceId, userId);
+  if (!pending) return false;
+
+  const followText = normalizeText(text);
+  if (/^(キャンセル|やめる|中止)$/i.test(followText)) {
+    clearPending(spaceId, userId);
+    await send("キャンセルしました。");
+    return true;
+  }
+
+  if (pending.action === "create_task") {
+    const title = followText;
+    if (!title) {
+      await send("タスク名が分かりません。もう一度教えてください。");
+      return true;
+    }
+    await send("追加中…");
+    await sheetsAppendTask({
+      spaceId,
+      project_id: "",
+      title,
+      description: "",
+      status: "open",
+      due_at: "",
+      created_by: userId,
+    });
+    await send(buildCreatedSummary("タスク", { title, status: "open" }));
+    await send("未設定: 期限 / 詳細 / プロジェクト");
+    clearPending(spaceId, userId);
+    return true;
+  }
+
+  if (pending.action === "create_project") {
+    const title = followText;
+    if (!title) {
+      await send("プロジェクト名が分かりません。もう一度教えてください。");
+      return true;
+    }
+    await send("追加中…");
+    await sheetsAppendProject({
+      spaceId,
+      title,
+      description: "",
+      status: "open",
+      due_at: "",
+      created_by: userId,
+    });
+    await send(buildCreatedSummary("プロジェクト", { title, status: "open" }));
+    await send("未設定: 期限 / 詳細");
+    clearPending(spaceId, userId);
+    return true;
+  }
+
+  if (pending.action === "delete_task") {
+    const matches = await findTasksByQuery(spaceId, sanitizeQuery(followText), 200);
+    if (!matches.length) {
+      await send("一致するタスクが見つかりませんでした。もう一度教えてください。");
+      return true;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+      return true;
+    }
+    await send("削除中…");
+    await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+    await send(`タスクを削除しました: ${matches[0].title}`);
+    clearPending(spaceId, userId);
+    return true;
+  }
+
+  if (pending.action === "delete_project") {
+    const matches = await findProjectsByQuery(spaceId, sanitizeQuery(followText), 200);
+    if (!matches.length) {
+      await send("一致するプロジェクトが見つかりませんでした。もう一度教えてください。");
+      return true;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}`);
+      return true;
+    }
+    await send("削除中…");
+    await sheetsUpdateProject(matches[0].project_id, { status: "deleted", deleted_at: new Date().toISOString() });
+    await send(`プロジェクトを削除しました: ${matches[0].title}`);
+    clearPending(spaceId, userId);
+    return true;
+  }
+
+  return false;
 }
 
 // =====================
@@ -1783,6 +1912,216 @@ app.post("/line/webhook", async (req, res) => {
       }
     }
   }
+});
+
+// =====================
+// Discord Interactions
+// =====================
+app.post("/discord/interactions", async (req, res) => {
+  if (!verifyDiscordSignature(req)) {
+    return res.status(401).send("invalid signature");
+  }
+
+  const interaction = req.body || {};
+  if (interaction.type === 1) {
+    return res.json({ type: 1 }); // PING
+  }
+
+  const userId = getDiscordUserId(interaction);
+  const spaceId = getDiscordSpaceId(interaction);
+  if (!userId || !spaceId) {
+    return res.json({ type: 4, data: { content: "ユーザー情報が取得できませんでした。" } });
+  }
+
+  // Acknowledge immediately to avoid timeouts
+  res.json({ type: 5 }); // DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+
+  const options = (interaction.data && interaction.data.options) || [];
+  const textOpt = options.find((o) => o.name === "text") || options[0];
+  let text = textOpt && textOpt.value ? String(textOpt.value) : "";
+  if (!text) {
+    text = (interaction.data && interaction.data.name) || "";
+  }
+
+  const send = async (content) => {
+    await discordFollowup(DISCORD_APP_ID, interaction.token, content);
+  };
+
+  // Follow-up handling without mention (same user only)
+  const pendingHandled = await handlePendingText({ spaceId, userId, text, send });
+  if (pendingHandled) return;
+
+  const stripped = normalizeText(text);
+  if (!stripped) {
+    await send("内容を教えてください。");
+    return;
+  }
+
+  const templ = await matchTemplate(stripped);
+  const fast = templ || regexQuickParse(stripped);
+  let cmd;
+  if (fast) {
+    const due = parseDueAtFromText(stripped);
+    if (due) fast.due_at = due;
+    cmd = fast;
+  } else {
+    await send("解釈中…");
+    cmd = await parseCommandFromText(text);
+  }
+  await recordTemplate(stripped, cmd);
+
+  if (cmd.action === "ask_user") {
+    const question = cmd.question || "対象を教えてください。";
+    await send(question);
+    const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
+    setPending(spaceId, userId, { action: pendingAction });
+    return;
+  }
+
+  if (cmd.action === "unknown") {
+    const intent = inferIntentFromText(stripped);
+    if (intent.action === "delete" && intent.targetType && intent.missingTarget) {
+      await send(intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？");
+      setPending(spaceId, userId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
+      return;
+    }
+    if (intent.action === "create" && intent.targetType) {
+      await send(intent.targetType === "project" ? "追加するプロジェクト名を教えてください。" : "追加するタスク名を教えてください。");
+      setPending(spaceId, userId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
+      return;
+    }
+    await send(buildUnknownResponse(stripped, intent));
+    return;
+  }
+
+  if (cmd.action === "list_tasks") {
+    const tasks = await sheetsGetTasksBySpace(spaceId, 20);
+    await send(formatTaskList(tasks));
+    return;
+  }
+
+  if (cmd.action === "list_projects") {
+    const projects = await sheetsGetProjectsBySpace(spaceId, 50);
+    await send(formatProjectList(projects));
+    return;
+  }
+
+  if (cmd.action === "complete_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("完了にするタスクが見つかりません。例: 議事録のタスク終わったよ");
+      return;
+    }
+    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
+    if (!matches.length) {
+      await send("一致するタスクが見つかりませんでした。");
+      return;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+      return;
+    }
+    await sheetsUpdateTask(matches[0].task_id, { status: "done", done_at: new Date().toISOString() });
+    await send(`タスクを完了にしました: ${matches[0].title}`);
+    return;
+  }
+
+  if (cmd.action === "reopen_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("再開するタスクが見つかりません。例: 議事録のタスク再開");
+      return;
+    }
+    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
+    if (!matches.length) {
+      await send("一致するタスクが見つかりませんでした。");
+      return;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+      return;
+    }
+    await sheetsUpdateTask(matches[0].task_id, { status: "open", done_at: "" });
+    await send(`タスクを再開にしました: ${matches[0].title}`);
+    return;
+  }
+
+  if (cmd.action === "delete_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("どのタスクを削除しますか？");
+      setPending(spaceId, userId, { action: "delete_task" });
+      return;
+    }
+    const items = splitQueries(q).map(sanitizeQuery).filter(Boolean);
+    const deleted = [];
+    for (const item of items) {
+      const matches = await findTasksByQuery(spaceId, item, 200);
+      if (!matches.length) {
+        await send(`一致するタスクが見つかりませんでした: ${item}`);
+        continue;
+      }
+      if (matches.length > 1) {
+        await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+        continue;
+      }
+      await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+      deleted.push(matches[0].title);
+    }
+    if (deleted.length) await send(`削除しました: ${deleted.join("、")}`);
+    return;
+  }
+
+  if (cmd.action === "create_task") {
+    const title = (cmd.title || "").trim();
+    if (!title) {
+      await send("タスク名が分かりません。例: 議事録作成を明日18時までに追加");
+      return;
+    }
+    let projectId = cmd.project_id || "";
+    let projectTitle = cmd.project_title || "";
+    if (projectTitle && !projectId) {
+      const matches = await findProjectsByQuery(spaceId, projectTitle, 200);
+      if (matches.length === 1) {
+        projectId = matches[0].project_id;
+        projectTitle = matches[0].title || projectTitle;
+      } else if (matches.length > 1) {
+        await send(`複数のプロジェクトが見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}`);
+        return;
+      }
+    }
+    await sheetsAppendTask({
+      spaceId,
+      project_id: projectId,
+      title,
+      description: cmd.description || "",
+      status: cmd.status || "open",
+      due_at: cmd.due_at || "",
+      created_by: userId,
+    });
+    await send(buildCreatedSummary("タスク", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "", project_title: projectTitle }));
+    return;
+  }
+
+  if (cmd.action === "create_project") {
+    const title = (cmd.title || cmd.project_title || "").trim();
+    if (!title) {
+      await send("プロジェクト名が分かりません。例: プロジェクト『卒論』を追加");
+      return;
+    }
+    await sheetsAppendProject({
+      spaceId,
+      title,
+      description: cmd.description || "",
+      status: cmd.status || "open",
+      due_at: cmd.due_at || "",
+      created_by: userId,
+    });
+    await send(buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }));
+    return;
+  }
+
+  await send("解釈できませんでした。『タスク一覧』『タスク追加』などをお試しください。");
 });
 
 const port = process.env.PORT || 8080;
