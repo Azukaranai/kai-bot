@@ -4,7 +4,8 @@
   "main": "index.js",
   "license": "UNLICENSED",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "migrate:db": "node scripts/migrate_sheets_to_db.js"
   },
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "^1.8.5",
