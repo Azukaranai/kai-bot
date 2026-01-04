@@ -8,6 +8,7 @@ const { google } = require("googleapis");
 const nacl = require("tweetnacl");
 const { Pool } = require("pg");
 const { Connector } = require("@google-cloud/cloud-sql-connector");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 
 // =====================
 // Env
@@ -31,6 +32,7 @@ const VERTEX_MODEL_ID = process.env.KAI_BOT_VERTEX_MODEL_ID || process.env.KAI_B
 // Discord
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
 const DISCORD_APP_ID = process.env.DISCORD_APP_ID;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 
 // DB (Cloud SQL Postgres)
 const DB_INSTANCE = process.env.KAI_BOT_DB_INSTANCE;
@@ -381,6 +383,191 @@ async function handlePendingText({ spaceId, userId, text, send }) {
   }
 
   return false;
+}
+
+async function processDiscordText({ text, spaceId, userId, send }) {
+  const pendingHandled = await handlePendingText({ spaceId, userId, text, send });
+  if (pendingHandled) return;
+
+  const stripped = normalizeText(text);
+  if (!stripped) {
+    await send("内容を教えてください。");
+    return;
+  }
+
+  const templ = await matchTemplate(stripped);
+  const fast = templ || regexQuickParse(stripped);
+  let cmd;
+  if (fast) {
+    const due = parseDueAtFromText(stripped);
+    if (due) fast.due_at = due;
+    cmd = fast;
+  } else {
+    await send("解釈中…");
+    cmd = await parseCommandFromText(text);
+  }
+  await recordTemplate(stripped, cmd);
+
+  if (cmd.action === "ask_user") {
+    const question = cmd.question || "対象を教えてください。";
+    await send(question);
+    const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
+    setPending(spaceId, userId, { action: pendingAction });
+    return;
+  }
+
+  if (cmd.action === "unknown") {
+    const intent = inferIntentFromText(stripped);
+    if (intent.action === "delete" && intent.targetType && intent.missingTarget) {
+      await send(intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？");
+      setPending(spaceId, userId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
+      return;
+    }
+    if (intent.action === "create" && intent.targetType) {
+      await send(intent.targetType === "project" ? "追加するプロジェクト名を教えてください。" : "追加するタスク名を教えてください。");
+      setPending(spaceId, userId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
+      return;
+    }
+    await send(buildUnknownResponse(stripped, intent));
+    return;
+  }
+
+  if (cmd.action === "list_tasks") {
+    const tasks = await sheetsGetTasksBySpace(spaceId, 20);
+    await send(formatTaskList(tasks));
+    return;
+  }
+
+  if (cmd.action === "list_projects") {
+    const projects = await sheetsGetProjectsBySpace(spaceId, 50);
+    await send(formatProjectList(projects));
+    return;
+  }
+
+  if (cmd.action === "complete_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("完了にするタスクが見つかりません。例: 議事録のタスク終わったよ");
+      return;
+    }
+    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
+    if (!matches.length) {
+      await send("一致するタスクが見つかりませんでした。");
+      return;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+      return;
+    }
+    await sheetsUpdateTask(matches[0].task_id, { status: "done", done_at: new Date().toISOString() });
+    await send(`タスクを完了にしました: ${matches[0].title}`);
+    return;
+  }
+
+  if (cmd.action === "reopen_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("再開するタスクが見つかりません。例: 議事録のタスク再開");
+      return;
+    }
+    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
+    if (!matches.length) {
+      await send("一致するタスクが見つかりませんでした。");
+      return;
+    }
+    if (matches.length > 1) {
+      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+      return;
+    }
+    await sheetsUpdateTask(matches[0].task_id, { status: "open", done_at: "" });
+    await send(`タスクを再開にしました: ${matches[0].title}`);
+    return;
+  }
+
+  if (cmd.action === "delete_task") {
+    const q = cmd.task_id || cmd.query || cmd.title;
+    if (!q) {
+      await send("どのタスクを削除しますか？");
+      setPending(spaceId, userId, { action: "delete_task" });
+      return;
+    }
+    const items = splitQueries(q).map(sanitizeQuery).filter(Boolean);
+    const deleted = [];
+    for (const item of items) {
+      const matches = await findTasksByQuery(spaceId, item, 200);
+      if (!matches.length) {
+        await send(`一致するタスクが見つかりませんでした: ${item}`);
+        continue;
+      }
+      if (matches.length > 1) {
+        await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
+        continue;
+      }
+      await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
+      deleted.push(matches[0].title);
+    }
+    if (deleted.length) await send(`削除しました: ${deleted.join("、")}`);
+    return;
+  }
+
+  if (cmd.action === "create_task") {
+    const title = (cmd.title || "").trim();
+    if (!title) {
+      await send("タスク名が分かりません。例: 議事録作成を明日18時までに追加");
+      return;
+    }
+    let projectId = cmd.project_id || "";
+    let projectTitle = cmd.project_title || "";
+    if (projectTitle && !projectId) {
+      const matches = await findProjectsByQuery(spaceId, projectTitle, 200);
+      if (matches.length === 1) {
+        projectId = matches[0].project_id;
+        projectTitle = matches[0].title || projectTitle;
+      } else if (matches.length > 1) {
+        await send(`複数のプロジェクトが見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}`);
+        return;
+      }
+    }
+    await sheetsAppendTask({
+      spaceId,
+      project_id: projectId,
+      title,
+      description: cmd.description || "",
+      status: cmd.status || "open",
+      due_at: cmd.due_at || "",
+      created_by: userId,
+    });
+    await send(
+      buildCreatedSummary("タスク", {
+        title,
+        description: cmd.description || "",
+        status: cmd.status || "open",
+        due_at: cmd.due_at || "",
+        project_title: projectTitle,
+      })
+    );
+    return;
+  }
+
+  if (cmd.action === "create_project") {
+    const title = (cmd.title || cmd.project_title || "").trim();
+    if (!title) {
+      await send("プロジェクト名が分かりません。例: プロジェクト『卒論』を追加");
+      return;
+    }
+    await sheetsAppendProject({
+      spaceId,
+      title,
+      description: cmd.description || "",
+      status: cmd.status || "open",
+      due_at: cmd.due_at || "",
+      created_by: userId,
+    });
+    await send(buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }));
+    return;
+  }
+
+  await send("解釈できませんでした。『タスク一覧』『タスク追加』などをお試しください。");
 }
 
 // =====================
@@ -1146,6 +1333,23 @@ function parseProjectTitleFromText(text) {
     t.match(/([^\s]+?)プロジェクト/);
   if (!m) return "";
   return String(m[1] || "").trim();
+}
+
+function isDiscordTriggered(text, botId) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (botId && new RegExp(`<@!?${botId}>`).test(t)) return true;
+  const headOnly = /^(?:ボット|ぼっと|おーい)(?:\s|[、,。.!！?？:：]|$)/;
+  return headOnly.test(t);
+}
+
+function stripDiscordTrigger(text, botId) {
+  let t = String(text || "");
+  if (botId) {
+    t = t.replace(new RegExp(`<@!?${botId}>`, "g"), " ");
+  }
+  t = t.replace(/^(?:ボット|ぼっと|おーい)(?:\s|[、,。.!！?？:：])*/i, " ");
+  return normalizeText(t);
 }
 
 // =====================
@@ -2182,182 +2386,73 @@ app.post("/discord/interactions", async (req, res) => {
     await discordFollowup(DISCORD_APP_ID, interaction.token, content);
   };
 
-  // Follow-up handling without mention (same user only)
-  const pendingHandled = await handlePendingText({ spaceId, userId, text, send });
-  if (pendingHandled) return;
-
-  const stripped = normalizeText(text);
-  if (!stripped) {
-    await send("内容を教えてください。");
-    return;
-  }
-
-  const templ = await matchTemplate(stripped);
-  const fast = templ || regexQuickParse(stripped);
-  let cmd;
-  if (fast) {
-    const due = parseDueAtFromText(stripped);
-    if (due) fast.due_at = due;
-    cmd = fast;
-  } else {
-    await send("解釈中…");
-    cmd = await parseCommandFromText(text);
-  }
-  await recordTemplate(stripped, cmd);
-
-  if (cmd.action === "ask_user") {
-    const question = cmd.question || "対象を教えてください。";
-    await send(question);
-    const pendingAction = cmd.next_action || (cmd.target_type === "project" ? "update_project" : "update_task");
-    setPending(spaceId, userId, { action: pendingAction });
-    return;
-  }
-
-  if (cmd.action === "unknown") {
-    const intent = inferIntentFromText(stripped);
-    if (intent.action === "delete" && intent.targetType && intent.missingTarget) {
-      await send(intent.targetType === "project" ? "どのプロジェクトですか？" : "どのタスクですか？");
-      setPending(spaceId, userId, { action: intent.targetType === "project" ? "delete_project" : "delete_task" });
-      return;
-    }
-    if (intent.action === "create" && intent.targetType) {
-      await send(intent.targetType === "project" ? "追加するプロジェクト名を教えてください。" : "追加するタスク名を教えてください。");
-      setPending(spaceId, userId, { action: intent.targetType === "project" ? "create_project" : "create_task" });
-      return;
-    }
-    await send(buildUnknownResponse(stripped, intent));
-    return;
-  }
-
-  if (cmd.action === "list_tasks") {
-    const tasks = await sheetsGetTasksBySpace(spaceId, 20);
-    await send(formatTaskList(tasks));
-    return;
-  }
-
-  if (cmd.action === "list_projects") {
-    const projects = await sheetsGetProjectsBySpace(spaceId, 50);
-    await send(formatProjectList(projects));
-    return;
-  }
-
-  if (cmd.action === "complete_task") {
-    const q = cmd.task_id || cmd.query || cmd.title;
-    if (!q) {
-      await send("完了にするタスクが見つかりません。例: 議事録のタスク終わったよ");
-      return;
-    }
-    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
-    if (!matches.length) {
-      await send("一致するタスクが見つかりませんでした。");
-      return;
-    }
-    if (matches.length > 1) {
-      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
-      return;
-    }
-    await sheetsUpdateTask(matches[0].task_id, { status: "done", done_at: new Date().toISOString() });
-    await send(`タスクを完了にしました: ${matches[0].title}`);
-    return;
-  }
-
-  if (cmd.action === "reopen_task") {
-    const q = cmd.task_id || cmd.query || cmd.title;
-    if (!q) {
-      await send("再開するタスクが見つかりません。例: 議事録のタスク再開");
-      return;
-    }
-    const matches = await findTasksByQuery(spaceId, sanitizeQuery(q), 200);
-    if (!matches.length) {
-      await send("一致するタスクが見つかりませんでした。");
-      return;
-    }
-    if (matches.length > 1) {
-      await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
-      return;
-    }
-    await sheetsUpdateTask(matches[0].task_id, { status: "open", done_at: "" });
-    await send(`タスクを再開にしました: ${matches[0].title}`);
-    return;
-  }
-
-  if (cmd.action === "delete_task") {
-    const q = cmd.task_id || cmd.query || cmd.title;
-    if (!q) {
-      await send("どのタスクを削除しますか？");
-      setPending(spaceId, userId, { action: "delete_task" });
-      return;
-    }
-    const items = splitQueries(q).map(sanitizeQuery).filter(Boolean);
-    const deleted = [];
-    for (const item of items) {
-      const matches = await findTasksByQuery(spaceId, item, 200);
-      if (!matches.length) {
-        await send(`一致するタスクが見つかりませんでした: ${item}`);
-        continue;
-      }
-      if (matches.length > 1) {
-        await send(`複数見つかりました。より具体的に教えてください:\n${formatTaskMatches(matches)}`);
-        continue;
-      }
-      await sheetsUpdateTask(matches[0].task_id, { status: "deleted", deleted_at: new Date().toISOString() });
-      deleted.push(matches[0].title);
-    }
-    if (deleted.length) await send(`削除しました: ${deleted.join("、")}`);
-    return;
-  }
-
-  if (cmd.action === "create_task") {
-    const title = (cmd.title || "").trim();
-    if (!title) {
-      await send("タスク名が分かりません。例: 議事録作成を明日18時までに追加");
-      return;
-    }
-    let projectId = cmd.project_id || "";
-    let projectTitle = cmd.project_title || "";
-    if (projectTitle && !projectId) {
-      const matches = await findProjectsByQuery(spaceId, projectTitle, 200);
-      if (matches.length === 1) {
-        projectId = matches[0].project_id;
-        projectTitle = matches[0].title || projectTitle;
-      } else if (matches.length > 1) {
-        await send(`複数のプロジェクトが見つかりました。より具体的に教えてください:\n${formatProjectMatches(matches)}`);
-        return;
-      }
-    }
-    await sheetsAppendTask({
-      spaceId,
-      project_id: projectId,
-      title,
-      description: cmd.description || "",
-      status: cmd.status || "open",
-      due_at: cmd.due_at || "",
-      created_by: userId,
-    });
-    await send(buildCreatedSummary("タスク", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "", project_title: projectTitle }));
-    return;
-  }
-
-  if (cmd.action === "create_project") {
-    const title = (cmd.title || cmd.project_title || "").trim();
-    if (!title) {
-      await send("プロジェクト名が分かりません。例: プロジェクト『卒論』を追加");
-      return;
-    }
-    await sheetsAppendProject({
-      spaceId,
-      title,
-      description: cmd.description || "",
-      status: cmd.status || "open",
-      due_at: cmd.due_at || "",
-      created_by: userId,
-    });
-    await send(buildCreatedSummary("プロジェクト", { title, description: cmd.description || "", status: cmd.status || "open", due_at: cmd.due_at || "" }));
-    return;
-  }
-
-  await send("解釈できませんでした。『タスク一覧』『タスク追加』などをお試しください。");
+  await processDiscordText({ text, spaceId, userId, send });
 });
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
+// =====================
+// Discord Gateway (mentions / keywords)
+// =====================
+if (DISCORD_BOT_TOKEN) {
+  const discordClient = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.DirectMessages,
+    ],
+    partials: [Partials.Channel],
+  });
+
+  discordClient.on("messageCreate", async (message) => {
+    try {
+      if (!message || !message.content) return;
+      if (message.author && message.author.bot) return;
+
+      const botId = discordClient.user ? discordClient.user.id : null;
+      const triggered = isDiscordTriggered(message.content, botId);
+      if (!triggered) {
+        const spaceId = message.guildId || message.channelId;
+        const userId = message.author ? message.author.id : "";
+        if (spaceId && userId) {
+          const pending = getPending(spaceId, userId);
+          if (pending) {
+            await processDiscordText({
+              text: message.content,
+              spaceId,
+              userId,
+              send: async (content) => message.channel.send(content),
+            });
+          }
+        }
+        return;
+      }
+
+      const text = stripDiscordTrigger(message.content, botId);
+      const spaceId = message.guildId || message.channelId;
+      const userId = message.author ? message.author.id : "";
+      if (!spaceId || !userId) return;
+
+      await processDiscordText({
+        text,
+        spaceId,
+        userId,
+        send: async (content) => message.channel.send(content),
+      });
+    } catch (e) {
+      console.error("discord message error", e);
+    }
+  });
+
+  discordClient.on("ready", () => {
+    console.log(`Discord bot ready as ${discordClient.user ? discordClient.user.tag : "unknown"}`);
+  });
+
+  discordClient.login(DISCORD_BOT_TOKEN).catch((e) => {
+    console.error("discord login failed", e);
+  });
+} else {
+  console.warn("DISCORD_BOT_TOKEN is not set; Discord Gateway is disabled.");
+}

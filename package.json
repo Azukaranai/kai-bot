@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@google-cloud/cloud-sql-connector": "^1.8.5",
+    "discord.js": "^14.25.1",
     "dotenv": "^17.2.3",
     "express": "^4.22.1",
     "googleapis": "^169.0.0",
